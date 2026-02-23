@@ -193,6 +193,112 @@ class TagRemapper:
         return dict(self._map["material"])
 
 
+def _normalize_component(component: dict) -> dict:
+    """Normalize all tags in a component dict so they start from 1.
+    
+    Component tools may use arbitrary internal tag ranges (e.g., foundation
+    starts nodes at 1004 or 2000). This renumbers everything to start from 1
+    so the TagRemapper works correctly.
+    """
+    comp = dict(component)
+    
+    # Build offset maps for each tag type
+    for tag_type, list_key in [("node", "nodes"), ("element", "elements"), ("material", "materials"), ("section", "sections")]:
+        items = comp.get(list_key, [])
+        if not items:
+            continue
+        tags = [item.get("tag", 0) for item in items]
+        if not tags or min(tags) <= 1:
+            continue
+        
+        min_tag = min(tags)
+        offset = min_tag - 1
+        tag_map = {}
+        
+        # Renumber items
+        new_items = []
+        for item in items:
+            new = dict(item)
+            old_tag = new.get("tag", 0)
+            new_tag = old_tag - offset
+            tag_map[old_tag] = new_tag
+            new["tag"] = new_tag
+            new_items.append(new)
+        comp[list_key] = new_items
+        
+        # Update cross-references
+        if tag_type == "material":
+            # Fix material refs in elements
+            new_elems = []
+            for e in comp.get("elements", []):
+                ne = dict(e)
+                for mk in ("material", "section", "transform"):
+                    if mk in ne and isinstance(ne[mk], int) and ne[mk] in tag_map:
+                        ne[mk] = tag_map[ne[mk]]
+                # Fix material lists (e.g., materials=[101, 102])
+                if "materials" in ne and isinstance(ne["materials"], list):
+                    ne["materials"] = [tag_map.get(m, m) if isinstance(m, int) else m for m in ne["materials"]]
+                new_elems.append(ne)
+            comp["elements"] = new_elems
+            
+            # Fix material refs in springs
+            new_springs = []
+            for s in comp.get("springs", []):
+                ns = dict(s)
+                if "material" in ns and isinstance(ns["material"], int) and ns["material"] in tag_map:
+                    ns["material"] = tag_map[ns["material"]]
+                new_springs.append(ns)
+            comp["springs"] = new_springs
+        
+        if tag_type == "node":
+            # Fix node refs in elements
+            new_elems = []
+            for e in comp.get("elements", []):
+                ne = dict(e)
+                if "nodes" in ne and isinstance(ne["nodes"], list):
+                    ne["nodes"] = [tag_map.get(n, n) if isinstance(n, int) else n for n in ne["nodes"]]
+                new_elems.append(ne)
+            comp["elements"] = new_elems
+            
+            # Fix node refs in springs
+            new_springs = []
+            for s in comp.get("springs", []):
+                ns = dict(s)
+                if "node" in ns and isinstance(ns["node"], int):
+                    ns["node"] = tag_map.get(ns["node"], ns["node"])
+                new_springs.append(ns)
+            comp["springs"] = new_springs
+            
+            # Fix scalar node refs
+            for key in ("top_node", "base_node"):
+                if key in comp and isinstance(comp[key], int):
+                    comp[key] = tag_map.get(comp[key], comp[key])
+            for key in ("top_nodes", "base_nodes", "cap_nodes", "support_nodes", "midspan_nodes"):
+                if key in comp and isinstance(comp[key], list):
+                    comp[key] = [tag_map.get(n, n) if isinstance(n, int) else n for n in comp[key]]
+            
+            # Fix node refs in boundary conditions
+            new_bcs = []
+            for bc in comp.get("boundary_conditions", []):
+                nbc = dict(bc)
+                if "node" in nbc and isinstance(nbc["node"], int):
+                    nbc["node"] = tag_map.get(nbc["node"], nbc["node"])
+                new_bcs.append(nbc)
+            comp["boundary_conditions"] = new_bcs
+            
+            # Fix node refs in constraints
+            new_cons = []
+            for c in comp.get("constraints", []):
+                nc = dict(c)
+                for k in ("master", "slave", "node", "retained_node", "constrained_node"):
+                    if k in nc and isinstance(nc[k], int):
+                        nc[k] = tag_map.get(nc[k], nc[k])
+                new_cons.append(nc)
+            comp["constraints"] = new_cons
+    
+    return comp
+
+
 def _remap_component_nodes(nodes: list[dict], remapper: TagRemapper) -> list[dict]:
     """Remap node tags in a list of node dicts."""
     result = []
@@ -572,8 +678,12 @@ def _generate_materials_script(materials: list[dict], sections: list[dict]) -> s
         "",
     ]
 
+    seen_tags = set()
     for m in materials:
         tag = m["tag"]
+        if tag in seen_tags:
+            continue  # skip duplicate material tags
+        seen_tags.add(tag)
         mtype = m.get("type", "Elastic")
         desc = m.get("description", m.get("name", ""))
 
@@ -717,6 +827,9 @@ def _generate_elements_script(elements: list[dict]) -> str:
         if etype == "dispBeamColumn":
             sec = e.get("section", 1)
             tf = e.get("transform", 1)
+            # Handle string transforms (e.g., "Linear") — use a default tag
+            if isinstance(tf, str):
+                tf = 1  # Default to transform tag 1
             np_ = e.get("np", 5)
             lines.append(
                 f"ops.element('dispBeamColumn', {tag}, "
@@ -1008,6 +1121,12 @@ def assemble_model(
     fnd_remappers = []
     sub_remappers = []
     brg_remappers = []
+
+    # --- Normalize all components (tools use arbitrary internal tag ranges) ---
+    foundations = [_normalize_component(f) for f in foundations]
+    substructures = [_normalize_component(s) for s in substructures]
+    bearings = [_normalize_component(b) for b in bearings]
+    superstructure = _normalize_component(superstructure)
 
     # --- Foundations ---
     for i, fnd in enumerate(foundations):
