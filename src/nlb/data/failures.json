@@ -1,1 +1,110 @@
-{}
+[
+  {
+    "name": "I-35W Mississippi River Bridge",
+    "year": 2007,
+    "location": "Minneapolis, MN",
+    "type": "steel_truss",
+    "spans": [265, 458, 265],
+    "material": "steel",
+    "failure_mode": "gusset_plate_buckling",
+    "cause": "Under-designed gusset plates combined with added dead load (deck overlay, barriers) over decades. Original 0.5\" gusset plates were inadequate for the connections they served. Corrosion and increased loading pushed demand past capacity.",
+    "lesson": "Connection capacity must be checked when dead load increases over the bridge's life. Gusset plates are often the weakest link in truss bridges. Load rating should include all added dead load.",
+    "details": ["gusset_plate", "connection", "overload", "added_dead_load", "truss"]
+  },
+  {
+    "name": "Morandi Bridge (Ponte Morandi / Polcevera Viaduct)",
+    "year": 2018,
+    "location": "Genoa, Italy",
+    "type": "cable_stayed",
+    "spans": [141, 210, 210, 210, 141],
+    "material": "concrete",
+    "failure_mode": "tendon_corrosion",
+    "cause": "Corrosion of stay cables (concrete-encased steel tendons) over 51 years in marine/industrial environment. Unique Morandi design made inspection of tendons impossible without destructive testing.",
+    "lesson": "Tendons in aggressive environments must be inspectable and replaceable. Redundancy in cable systems is critical. Non-redundant structural systems require enhanced inspection.",
+    "details": ["cable_stayed", "tendon", "corrosion", "non_redundant", "marine_environment"]
+  },
+  {
+    "name": "FIU Pedestrian Bridge",
+    "year": 2018,
+    "location": "Miami, FL",
+    "type": "concrete_truss",
+    "spans": [174],
+    "material": "concrete",
+    "failure_mode": "node_shear_failure",
+    "cause": "Critical diagonal member (Member 11) was overstressed during construction. Cracking observed before collapse was misdiagnosed. Re-tensioning of post-tensioning rods at the node while traffic ran underneath caused catastrophic shear failure.",
+    "lesson": "Construction-stage analysis is mandatory. Cracks in concrete trusses indicate structural distress, not cosmetic issues. Never adjust structural elements over live traffic. Independent peer review of unusual structural systems is essential.",
+    "details": ["construction_load", "concrete", "truss", "peer_review", "shear"]
+  },
+  {
+    "name": "Mianus River Bridge",
+    "year": 1983,
+    "location": "Greenwich, CT",
+    "type": "steel_girder",
+    "spans": [100, 100, 100],
+    "material": "steel",
+    "failure_mode": "pin_hanger_failure",
+    "cause": "Corrosion of pin-and-hanger assembly in a suspended span. Clogged drainage directed water onto the connection. Lateral displacement of pin allowed hanger to slip off, dropping the suspended span.",
+    "lesson": "Pin-and-hanger connections are fracture-critical and corrosion-prone. Drainage must be directed away from structural connections. Redundancy eliminates single-point failure modes.",
+    "details": ["pin_hanger", "corrosion", "fracture_critical", "drainage", "suspended_span"]
+  },
+  {
+    "name": "Silver Bridge",
+    "year": 1967,
+    "location": "Point Pleasant, WV",
+    "type": "eyebar_chain_suspension",
+    "spans": [700],
+    "material": "steel",
+    "failure_mode": "eyebar_fracture",
+    "cause": "Stress corrosion cracking in a single eyebar of the suspension chain. The bridge had no redundancy — each chain link was a single eyebar (not paired). A 0.1-inch crack grew to failure under 40 years of cyclic loading.",
+    "lesson": "Non-redundant tension members (fracture-critical) are unacceptable in modern design. Fatigue and fracture must be explicitly designed against. Redundancy saves lives.",
+    "details": ["fracture_critical", "fatigue", "eyebar", "non_redundant", "stress_corrosion"]
+  },
+  {
+    "name": "I-40 Bridge over Arkansas River",
+    "year": 2002,
+    "location": "Webbers Falls, OK",
+    "type": "steel_girder",
+    "spans": [200, 200],
+    "material": "steel",
+    "failure_mode": "vessel_collision",
+    "cause": "Barge tow struck a bridge pier, causing two spans to collapse into the river. The pier had no collision protection (fender system). 14 people died.",
+    "lesson": "Vessel collision design per AASHTO 3.14 is critical for bridges over navigable waterways. Pier protection (dolphins, fenders) should be provided. Redundant pier design prevents progressive collapse from impact.",
+    "details": ["vessel_collision", "pier", "waterway", "fracture_critical", "impact"]
+  },
+  {
+    "name": "Skagit River Bridge (I-5)",
+    "year": 2013,
+    "location": "Mount Vernon, WA",
+    "type": "steel_truss",
+    "spans": [160, 160, 160, 160],
+    "material": "steel",
+    "failure_mode": "over_height_vehicle",
+    "cause": "Over-height truck struck overhead truss portal bracing, causing loss of lateral bracing and immediate collapse of one span. The through-truss design had low vertical clearance and was fracture-critical (non-redundant).",
+    "lesson": "Through-truss bridges with low clearance are vulnerable to vehicle impact. Fracture-critical members should be protected or the bridge should be designed for member loss. Vertical clearance must account for permit vehicles.",
+    "details": ["vehicle_impact", "truss", "fracture_critical", "lateral_bracing", "low_clearance"]
+  },
+  {
+    "name": "Schoharie Creek Bridge (I-90)",
+    "year": 1987,
+    "location": "Amsterdam, NY",
+    "type": "steel_girder",
+    "spans": [100, 100, 100, 100, 100],
+    "material": "steel",
+    "failure_mode": "scour",
+    "cause": "Scour undermined a pier footing during spring flood. The spread footing was founded on glacial till that was assumed to be non-erodible but actually eroded under sustained high-velocity flow. No riprap protection.",
+    "lesson": "Scour analysis per HEC-18 is mandatory for all water crossings. 'Non-erodible' soil assumptions must be verified. Foundations should be designed below computed scour depth or protected with riprap/countermeasures.",
+    "details": ["scour", "foundation", "spread_footing", "flood", "waterway"]
+  },
+  {
+    "name": "Hoan Bridge",
+    "year": 2000,
+    "location": "Milwaukee, WI",
+    "type": "steel_girder",
+    "spans": [260, 300, 260],
+    "material": "steel",
+    "failure_mode": "fatigue_fracture",
+    "cause": "Fatigue cracks at web gap details in steel plate girders. Cracks initiated at constraint-induced fatigue locations where cross-frame connection plates were not attached to the tension flange, creating out-of-plane distortion.",
+    "lesson": "Web gap fatigue (Category C' and worse) is a leading cause of steel bridge cracking. Connection plates should be positively attached to flanges. Distortion-induced fatigue must be addressed in design.",
+    "details": ["fatigue", "web_gap", "steel_girder", "cross_frame", "distortion"]
+  }
+]
