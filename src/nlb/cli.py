@@ -597,7 +597,7 @@ def _build_load_params(params: dict, site: dict) -> dict:
     n_girders = params.get("num_girders", 5)
     spacing = params.get("girder_spacing_ft", 8.0)
     deck_w = params.get("deck_width_ft") or (n_girders * spacing)
-    depth = params.get("girder_depth_in", 48.0)
+    depth = params.get("girder_depth_in") or 48.0
     
     # BridgeGeometry.span_ft expects a single float (max span for load generation)
     max_span = max(spans) if spans else 100.0

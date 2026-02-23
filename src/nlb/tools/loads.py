@@ -1050,7 +1050,7 @@ def _compute_wind_loads(
     p_ws = qz * WIND_GUST_FACTOR * WIND_CD_GIRDER  # psf
 
     # Exposed depth = girder depth + barrier (typ 3.5 ft)
-    exposed_depth_ft = geom.girder_depth_in / 12.0 + 3.5
+    exposed_depth_ft = (geom.girder_depth_in or 48.0) / 12.0 + 3.5  # default 48" if None
     # Distributed lateral load (klf)
     ws_klf = p_ws * exposed_depth_ft / 1000.0
     ws_kli = ws_klf / 12.0

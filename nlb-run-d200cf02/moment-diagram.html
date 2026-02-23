@@ -1,0 +1,617 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NLB — Moment Diagram | Single-span prestressed I-girder bridge, 80 ft span, 5 girders at 8 ft spacing, rural Tennessee.</title>
+<style>
+  :root {
+    --bg:        #0d1117;
+    --bg2:       #161b22;
+    --bg3:       #1c2128;
+    --border:    #30363d;
+    --red:       #e94560;
+    --cyan:      #00d2ff;
+    --green:     #3fb950;
+    --yellow:    #d29922;
+    --text:      #e6edf3;
+    --muted:     #8b949e;
+    --dim:       #484f58;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 14px;
+  }
+  body { display: flex; flex-direction: column; min-height: 100vh; padding: 24px; gap: 16px; }
+
+  /* ── Header ── */
+  .header { display: flex; align-items: baseline; gap: 12px; }
+  .header .logo { font-size: 18px; font-weight: 700; color: var(--red); letter-spacing: -0.5px; }
+  .header .pipe { color: var(--dim); }
+  .header .title { font-size: 16px; font-weight: 600; color: var(--text); }
+  .header .subtitle { font-size: 12px; color: var(--muted); margin-left: auto; }
+
+  /* ── Info bar ── */
+  .infobar {
+    display: flex; gap: 16px; flex-wrap: wrap;
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px 16px;
+  }
+  .info-item { display: flex; flex-direction: column; gap: 2px; }
+  .info-item .label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+  .info-item .value { font-size: 14px; font-weight: 600; color: var(--text); font-family: monospace; }
+  .info-item .value.pos { color: var(--cyan); }
+  .info-item .value.neg { color: var(--red); }
+  .info-item .value.ok  { color: var(--green); }
+
+  /* ── Canvas wrapper ── */
+  .chart-wrapper {
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 10px; padding: 0; overflow: hidden; flex: 1; min-height: 360px;
+    position: relative;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  /* ── Legend ── */
+  .legend {
+    display: flex; align-items: center; gap: 20px; flex-wrap: wrap;
+    padding: 10px 16px;
+    border-top: 1px solid var(--border);
+    background: var(--bg3);
+    font-size: 12px; color: var(--muted);
+  }
+  .legend-item { display: flex; align-items: center; gap: 6px; }
+  .swatch { width: 16px; height: 4px; border-radius: 2px; }
+  .sw-pos { background: var(--cyan); }
+  .sw-neg { background: var(--red); }
+  .sw-env { background: var(--yellow); }
+  .sw-support { width: 1px; height: 14px; border-radius: 0; background: var(--dim); }
+
+  /* ── Elevation strip ── */
+  .elevation-wrapper {
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 10px; overflow: hidden;
+  }
+  .elevation-label {
+    padding: 8px 16px 0;
+    font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em;
+  }
+  canvas.elev { display: block; width: 100%; }
+
+  /* ── Stats grid ── */
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }
+  .stat {
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 14px 16px;
+  }
+  .stat .s-label { font-size: 11px; color: var(--muted); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.04em; }
+  .stat .s-value { font-size: 22px; font-weight: 700; font-family: monospace; line-height: 1; }
+  .stat .s-unit  { font-size: 11px; color: var(--muted); margin-top: 3px; }
+  .stat .pos { color: var(--cyan); }
+  .stat .neg { color: var(--red); }
+  .stat .neutral { color: var(--text); }
+
+  /* ── Footer ── */
+  .footer { font-size: 11px; color: var(--dim); text-align: right; }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+  <span class="logo">🔴 NLB</span>
+  <span class="pipe">|</span>
+  <span class="title" id="bridgeTitle">Loading…</span>
+  <span class="subtitle" id="analysisLabel"></span>
+</div>
+
+<!-- Info bar -->
+<div class="infobar" id="infobar">
+  <div class="info-item">
+    <span class="label">Girder</span>
+    <span class="value" id="ib-girder">—</span>
+  </div>
+  <div class="info-item">
+    <span class="label">Load Case</span>
+    <span class="value" id="ib-loadcase">—</span>
+  </div>
+  <div class="info-item">
+    <span class="label">Total Length</span>
+    <span class="value" id="ib-length">—</span>
+  </div>
+  <div class="info-item">
+    <span class="label">Spans</span>
+    <span class="value" id="ib-spans">—</span>
+  </div>
+  <div class="info-item">
+    <span class="label">Max +M</span>
+    <span class="value pos" id="ib-maxpos">—</span>
+  </div>
+  <div class="info-item">
+    <span class="label">Max −M</span>
+    <span class="value neg" id="ib-maxneg">—</span>
+  </div>
+</div>
+
+<!-- Bridge elevation -->
+<div class="elevation-wrapper">
+  <div class="elevation-label">Bridge Elevation (Schematic)</div>
+  <canvas class="elev" id="elevCanvas" height="70"></canvas>
+</div>
+
+<!-- Moment diagram -->
+<div class="chart-wrapper">
+  <canvas id="momentCanvas"></canvas>
+</div>
+
+<!-- Legend -->
+<div class="legend">
+  <div class="legend-item"><div class="swatch sw-pos"></div><span>Positive Moment — tension in bottom flange</span></div>
+  <div class="legend-item"><div class="swatch sw-neg"></div><span>Negative Moment — tension in top flange</span></div>
+  <div class="legend-item"><div class="swatch sw-env"></div><span>Envelope (all combos)</span></div>
+  <div class="legend-item"><div class="swatch sw-support"></div><span>Support / Pier</span></div>
+  <div style="margin-left:auto; color: var(--dim); font-size:11px" id="footerNote">NLB — Natural Language Builder</div>
+</div>
+
+<!-- Stats -->
+<div class="stats">
+  <div class="stat">
+    <div class="s-label">Max Positive Moment</div>
+    <div class="s-value pos" id="st-maxpos">—</div>
+    <div class="s-unit">kip-ft</div>
+  </div>
+  <div class="stat">
+    <div class="s-label">Max Negative Moment</div>
+    <div class="s-value neg" id="st-maxneg">—</div>
+    <div class="s-unit">kip-ft</div>
+  </div>
+  <div class="stat">
+    <div class="s-label">Model Nodes</div>
+    <div class="s-value neutral" id="st-nodes">—</div>
+    <div class="s-unit">finite element nodes</div>
+  </div>
+  <div class="stat">
+    <div class="s-label">Model Elements</div>
+    <div class="s-value neutral" id="st-elems">—</div>
+    <div class="s-unit">beam/shell elements</div>
+  </div>
+  <div class="stat">
+    <div class="s-label">Load Combinations</div>
+    <div class="s-value neutral" id="st-combos">—</div>
+    <div class="s-unit">AASHTO LRFD</div>
+  </div>
+  <div class="stat">
+    <div class="s-label">Analysis Engine</div>
+    <div class="s-value neutral" style="font-size:14px">OpenSeesPy</div>
+    <div class="s-unit">nonlinear FEA</div>
+  </div>
+</div>
+
+<div class="footer" id="footer">Generated by NLB</div>
+
+<script>
+// ─────────────────────────────────────────────────────────────────────────────
+// DATA — injected by server or kept as demo placeholder
+// ─────────────────────────────────────────────────────────────────────────────
+window.NLB_DATA = {"bridge": "Single-span prestressed I-girder bridge, 80 ft span, 5 girders at 8 ft spacing, rural Tennessee.", "girder": "G3 (Interior)", "load_case": "Gravity Dead Load (DC)", "spans": [80.0], "supports_ft": [0.0, 80.0], "x_ft": [0.0, 4.0, 8.0, 12.0, 16.0, 20.0, 24.0, 28.0, 32.0, 36.0, 40.0, 44.0, 48.0, 52.0, 56.0, 60.0, 64.0, 68.0, 72.0, 76.0, 80.0], "M_kft": [0.0, 608.0, 1152.0, 1632.0, 2048.0, 2400.0, 2688.0, 2912.0, 3072.0, 3168.0, 3200.0, 3168.0, 3072.0, 2912.0, 2688.0, 2400.0, 2048.0, 1632.0, 1152.0, 608.0, 0.0], "M_env_max": [], "M_env_min": [], "node_count": 119, "element_count": 124, "load_combinations": 0, "generated_at": "2026-02-23 09:09 UTC"};
+  const BRIDGE_DATA = window.NLB_DATA || {
+  bridge: "Single-span prestressed I-girder bridge, 80 ft span, 5 girders at 8 ft spacing, rural Tennessee.",
+  girder: "G3 (Interior)",
+  load_case: "Gravity Dead Load (DC)",
+  spans: [80.0],
+  supports_ft: [0.0, 80.0],
+  x_ft: [0.0, 4.0, 8.0, 12.0, 16.0, 20.0, 24.0, 28.0, 32.0, 36.0, 40.0, 44.0, 48.0, 52.0, 56.0, 60.0, 64.0, 68.0, 72.0, 76.0, 80.0],
+  M_kft: [0.0, 608.0, 1152.0, 1632.0, 2048.0, 2400.0, 2688.0, 2912.0, 3072.0, 3168.0, 3200.0, 3168.0, 3072.0, 2912.0, 2688.0, 2400.0, 2048.0, 1632.0, 1152.0, 608.0, 0.0],
+  M_env_max: [],   // upper envelope (optional)
+  M_env_min: [],   // lower envelope (optional)
+  node_count: 119,
+  element_count: 124,
+  load_combinations: 0,
+  generated_at: "2026-02-23 09:09 UTC",
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Populate text fields
+// ─────────────────────────────────────────────────────────────────────────────
+function fmt(n) {
+  if (n == null || isNaN(n)) return '—';
+  return Math.round(n).toLocaleString();
+}
+
+const d = BRIDGE_DATA;
+document.getElementById('bridgeTitle').textContent = d.bridge || 'Bridge Analysis';
+document.getElementById('analysisLabel').textContent = `Generated ${d.generated_at || ''}`;
+document.getElementById('ib-girder').textContent    = d.girder || '—';
+document.getElementById('ib-loadcase').textContent  = d.load_case || '—';
+
+const spans = d.spans || [];
+const supports = d.supports_ft || [];
+const totalLen = supports.length ? Math.max(...supports) : (spans.reduce((a,b)=>a+b,0));
+document.getElementById('ib-length').textContent = fmt(totalLen) + ' ft';
+document.getElementById('ib-spans').textContent  = spans.join(' – ') + ' ft';
+
+const x   = d.x_ft   || [];
+const M   = d.M_kft  || [];
+const Mup = d.M_env_max || [];
+const Mdn = d.M_env_min || [];
+
+const maxPos = M.length ? Math.max(...M) : 0;
+const maxNeg = M.length ? Math.min(...M) : 0;
+document.getElementById('ib-maxpos').textContent = '+' + fmt(maxPos);
+document.getElementById('ib-maxneg').textContent = fmt(maxNeg);
+document.getElementById('st-maxpos').textContent = '+' + fmt(maxPos);
+document.getElementById('st-maxneg').textContent = fmt(maxNeg);
+document.getElementById('st-nodes').textContent  = fmt(d.node_count);
+document.getElementById('st-elems').textContent  = fmt(d.element_count);
+document.getElementById('st-combos').textContent = fmt(d.load_combinations);
+document.getElementById('footer').textContent    = `Natural Language Builder • ${d.generated_at || ''} • OpenSeesPy nonlinear FEA`;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Drawing helpers
+// ─────────────────────────────────────────────────────────────────────────────
+const CSS = {
+  bg:     '#0d1117',
+  bg2:    '#161b22',
+  bg3:    '#1c2128',
+  border: '#30363d',
+  red:    '#e94560',
+  cyan:   '#00d2ff',
+  green:  '#3fb950',
+  yellow: '#d29922',
+  text:   '#e6edf3',
+  muted:  '#8b949e',
+  dim:    '#484f58',
+  grid:   '#1c2128',
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Elevation schematic
+// ─────────────────────────────────────────────────────────────────────────────
+function drawElevation() {
+  const canvas = document.getElementById('elevCanvas');
+  const W = canvas.offsetWidth || 1200;
+  canvas.width  = W * devicePixelRatio;
+  canvas.height = 70 * devicePixelRatio;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(devicePixelRatio, devicePixelRatio);
+  const w = W, h = 70;
+
+  const pad = { left: 60, right: 20 };
+  const pw = w - pad.left - pad.right;
+  const xMin = 0, xMax = totalLen || 1;
+
+  function tx(v) { return pad.left + (v / xMax) * pw; }
+
+  ctx.fillStyle = CSS.bg2;
+  ctx.fillRect(0, 0, w, h);
+
+  // Deck line
+  const deckY = 30;
+  const deckH = 8;
+  const btmY  = deckY + deckH + 14; // bottom of girder
+
+  // Draw each span as a box (girder depth)
+  for (let i = 0; i < supports.length - 1; i++) {
+    const x1 = tx(supports[i]);
+    const x2 = tx(supports[i+1]);
+    const spanLabel = spans[i] ? spans[i] + ' ft' : '';
+
+    // Girder body
+    ctx.fillStyle = '#1e3a5f';
+    ctx.strokeStyle = CSS.cyan;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.rect(x1 + 2, deckY, x2 - x1 - 4, deckH);
+    ctx.fill();
+    ctx.stroke();
+
+    // Span label
+    ctx.fillStyle = CSS.muted;
+    ctx.font = `11px monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillText(`Span ${i+1}: ${spanLabel}`, (x1+x2)/2, deckY - 6);
+  }
+
+  // Deck top surface
+  ctx.strokeStyle = CSS.cyan;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(tx(0), deckY);
+  ctx.lineTo(tx(totalLen), deckY);
+  ctx.stroke();
+
+  // Supports (triangles + vertical lines)
+  supports.forEach((s, i) => {
+    const sx = tx(s);
+    const isEnd = (i === 0 || i === supports.length - 1);
+
+    // Vertical line down from deck
+    ctx.strokeStyle = CSS.dim;
+    ctx.lineWidth = 1;
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    ctx.moveTo(sx, deckY + deckH);
+    ctx.lineTo(sx, btmY);
+    ctx.stroke();
+
+    // Triangle
+    ctx.fillStyle = isEnd ? CSS.dim : '#3a3060';
+    ctx.strokeStyle = isEnd ? CSS.dim : '#8b5cf6';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(sx, btmY);
+    ctx.lineTo(sx - 8, btmY + 12);
+    ctx.lineTo(sx + 8, btmY + 12);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+
+    // Station label
+    ctx.fillStyle = CSS.dim;
+    ctx.font = '10px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(s + ' ft', sx, h - 2);
+  });
+
+  // Y-axis label
+  ctx.fillStyle = CSS.dim;
+  ctx.font = '10px sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText('Elevation', 4, h/2 + 4);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Moment diagram
+// ─────────────────────────────────────────────────────────────────────────────
+function drawMoment() {
+  const wrapper = document.querySelector('.chart-wrapper');
+  const canvas  = document.getElementById('momentCanvas');
+  const W = wrapper.offsetWidth  || 1200;
+  const H = wrapper.offsetHeight || 400;
+  canvas.width  = W * devicePixelRatio;
+  canvas.height = H * devicePixelRatio;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(devicePixelRatio, devicePixelRatio);
+
+  const pad = { left: 80, right: 24, top: 36, bottom: 44 };
+  const pw = W - pad.left - pad.right;
+  const ph = H - pad.top  - pad.bottom;
+
+  ctx.fillStyle = CSS.bg2;
+  ctx.fillRect(0, 0, W, H);
+
+  if (!x.length || !M.length) {
+    // No data — show placeholder message
+    ctx.fillStyle = CSS.muted;
+    ctx.font = '16px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Moment diagram will appear here after analysis completes.', W/2, H/2);
+    ctx.font = '13px monospace';
+    ctx.fillStyle = CSS.dim;
+    ctx.fillText('Run a bridge description through NLB to generate real data.', W/2, H/2 + 26);
+    return;
+  }
+
+  const xMin = 0, xMax = Math.max(...x, ...supports, totalLen);
+  const allM = [...M, ...Mup, ...Mdn].filter(v => v != null && !isNaN(v));
+  const mMax = Math.max(...allM, 0);
+  const mMin = Math.min(...allM, 0);
+  const mAbsMax = Math.max(Math.abs(mMin), Math.abs(mMax)) * 1.12 || 1;
+
+  function tx(v) { return pad.left + (v - xMin) / (xMax - xMin) * pw; }
+  function ty(v) { return pad.top + ph/2 - (v / mAbsMax) * (ph/2); }
+
+  // ── Grid lines ──
+  ctx.strokeStyle = CSS.grid;
+  ctx.lineWidth = 0.5;
+  [-1, -0.5, 0, 0.5, 1].forEach(f => {
+    const yy = ty(f * mAbsMax);
+    ctx.beginPath(); ctx.moveTo(pad.left, yy); ctx.lineTo(W - pad.right, yy); ctx.stroke();
+  });
+
+  // ── Y-axis labels ──
+  ctx.fillStyle = CSS.muted;
+  ctx.font = '10px monospace';
+  ctx.textAlign = 'right';
+  [-1, -0.5, 0, 0.5, 1].forEach(f => {
+    const val = Math.round(f * mAbsMax);
+    ctx.fillText(val.toLocaleString(), pad.left - 6, ty(f * mAbsMax) + 4);
+  });
+
+  // Y-axis label
+  ctx.save();
+  ctx.translate(14, pad.top + ph/2);
+  ctx.rotate(-Math.PI/2);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = CSS.dim;
+  ctx.font = '11px sans-serif';
+  ctx.fillText('Moment (kip-ft)', 0, 0);
+  ctx.restore();
+
+  // ── X-axis labels ──
+  ctx.fillStyle = CSS.muted;
+  ctx.font = '10px monospace';
+  ctx.textAlign = 'center';
+  const xTicks = Math.min(10, supports.length + 4);
+  const xStep = Math.round(xMax / xTicks / 50) * 50 || 50;
+  for (let v = 0; v <= xMax; v += xStep) {
+    ctx.fillText(v + ' ft', tx(v), H - pad.bottom + 14);
+  }
+
+  // ── Zero line ──
+  ctx.strokeStyle = CSS.border;
+  ctx.lineWidth = 1;
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  ctx.moveTo(pad.left, ty(0));
+  ctx.lineTo(W - pad.right, ty(0));
+  ctx.stroke();
+
+  // ── Support lines ──
+  ctx.strokeStyle = CSS.dim;
+  ctx.setLineDash([5, 5]);
+  ctx.lineWidth = 1;
+  supports.forEach((s, i) => {
+    const sx = tx(s);
+    const isEnd = (i === 0 || i === supports.length - 1);
+    ctx.strokeStyle = isEnd ? CSS.dim : '#4a3a70';
+    ctx.beginPath();
+    ctx.moveTo(sx, pad.top);
+    ctx.lineTo(sx, H - pad.bottom);
+    ctx.stroke();
+
+    // Triangle marker
+    ctx.setLineDash([]);
+    ctx.fillStyle = isEnd ? '#333' : '#2a1f50';
+    ctx.strokeStyle = isEnd ? CSS.dim : '#7c59c4';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(sx, ty(0) + 1);
+    ctx.lineTo(sx - 7, ty(0) + 10);
+    ctx.lineTo(sx + 7, ty(0) + 10);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    ctx.setLineDash([5, 5]);
+  });
+  ctx.setLineDash([]);
+
+  // ── Envelope fill (if provided) ──
+  if (Mup.length === x.length && Mdn.length === x.length) {
+    ctx.beginPath();
+    ctx.moveTo(tx(x[0]), ty(Mup[0]));
+    for (let i = 1; i < x.length; i++) ctx.lineTo(tx(x[i]), ty(Mup[i]));
+    for (let i = x.length - 1; i >= 0; i--) ctx.lineTo(tx(x[i]), ty(Mdn[i]));
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(210, 153, 34, 0.08)';
+    ctx.fill();
+
+    // Envelope lines
+    [[Mup, CSS.yellow, 0.6], [Mdn, CSS.yellow, 0.6]].forEach(([arr, col, alpha]) => {
+      ctx.strokeStyle = col;
+      ctx.globalAlpha = alpha;
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.moveTo(tx(x[0]), ty(arr[0]));
+      for (let i = 1; i < x.length; i++) ctx.lineTo(tx(x[i]), ty(arr[i]));
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1;
+    });
+  }
+
+  // ── Moment diagram fill ──
+  ctx.beginPath();
+  ctx.moveTo(tx(x[0]), ty(0));
+  for (let i = 0; i < x.length; i++) ctx.lineTo(tx(x[i]), ty(M[i]));
+  ctx.lineTo(tx(x[x.length-1]), ty(0));
+  ctx.closePath();
+
+  const grad = ctx.createLinearGradient(0, ty(mMax), 0, ty(mMin));
+  grad.addColorStop(0,   'rgba(0, 210, 255, 0.22)');
+  grad.addColorStop(0.5, 'rgba(60, 60, 80, 0.05)');
+  grad.addColorStop(1,   'rgba(233, 69, 96, 0.22)');
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  // ── Moment line (colored by sign) ──
+  for (let i = 1; i < x.length; i++) {
+    ctx.strokeStyle = M[i] >= 0 ? CSS.cyan : CSS.red;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(tx(x[i-1]), ty(M[i-1]));
+    ctx.lineTo(tx(x[i]),   ty(M[i]));
+    ctx.stroke();
+  }
+
+  // ── Max/min annotations ──
+  const maxIdx = M.indexOf(Math.max(...M));
+  const minIdx = M.indexOf(Math.min(...M));
+
+  function annotate(idx, color, above) {
+    const px = tx(x[idx]);
+    const py = ty(M[idx]);
+    const label = (M[idx] >= 0 ? '+' : '') + fmt(M[idx]) + ' k-ft';
+    const yOff = above ? -14 : 18;
+
+    ctx.fillStyle = color;
+    ctx.font = 'bold 11px monospace';
+    ctx.textAlign = 'center';
+
+    // Background pill
+    const tw = ctx.measureText(label).width;
+    ctx.fillStyle = CSS.bg2 + 'cc';
+    ctx.beginPath();
+    ctx.roundRect(px - tw/2 - 5, py + yOff - 13, tw + 10, 18, 4);
+    ctx.fill();
+
+    ctx.fillStyle = color;
+    ctx.fillText(label, px, py + yOff);
+
+    // Tick line
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(px, py);
+    ctx.lineTo(px, py + yOff * 0.7);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  if (maxIdx !== -1) annotate(maxIdx, CSS.cyan, true);
+  if (minIdx !== -1) annotate(minIdx, CSS.red, false);
+
+  // ── Chart title ──
+  ctx.fillStyle = CSS.text;
+  ctx.font = 'bold 13px sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText(`Bending Moment Diagram (Mz) — ${d.load_case || 'Gravity DC'}`, pad.left, 22);
+
+  // ── Span mid-labels ──
+  ctx.fillStyle = CSS.dim;
+  ctx.font = '11px sans-serif';
+  ctx.textAlign = 'center';
+  for (let i = 0; i < supports.length - 1; i++) {
+    const midX = tx((supports[i] + supports[i+1]) / 2);
+    ctx.fillText(`Span ${i+1}`, midX, H - pad.bottom + 28);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Init + resize
+// ─────────────────────────────────────────────────────────────────────────────
+function render() {
+  drawElevation();
+  drawMoment();
+}
+
+render();
+window.addEventListener('resize', () => {
+  clearTimeout(window._resizeT);
+  window._resizeT = setTimeout(render, 120);
+});
+
+// Allow parent page to push new data via postMessage
+window.addEventListener('message', (e) => {
+  if (e.data && e.data.type === 'nlb_data') {
+    Object.assign(BRIDGE_DATA, e.data.payload);
+    // Refresh data references
+    Object.assign(d, BRIDGE_DATA);
+    // Re-bind arrays
+    x.length = 0; x.push(...(d.x_ft || []));
+    M.length = 0; M.push(...(d.M_kft || []));
+    Mup.length = 0; Mup.push(...(d.M_env_max || []));
+    Mdn.length = 0; Mdn.push(...(d.M_env_min || []));
+    document.getElementById('bridgeTitle').textContent = d.bridge || 'Bridge Analysis';
+    render();
+  }
+});
+</script>
+</body>
+</html>

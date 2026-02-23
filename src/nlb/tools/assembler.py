@@ -1024,6 +1024,9 @@ def _generate_nodes_script(nodes: list[dict], boundary_conditions: list[dict],
     for bc in boundary_conditions:
         node = bc.get("node", 0)
         fixity = bc.get("fixity", [1, 1, 1, 1, 1, 1])
+        # Override: always fix foundation base nodes (springs provide stiffness above)
+        if all(f == 0 for f in fixity):
+            fixity = [1, 1, 1, 1, 1, 1]
         fixed_nodes[node] = fixity
 
     for n in nodes:
@@ -1311,7 +1314,7 @@ def _generate_analysis_script(analysis_sequence: list[str],
                 "",
                 "ops.system('UmfPack')",
                 "ops.numberer('Plain')",
-                "ops.constraints('Penalty', 1.0e14, 1.0e14)",
+                "ops.constraints('Penalty', 1.0e12, 1.0e12)",
                 "ops.integrator('LoadControl', 1.0)",
                 "ops.test('NormUnbalance', 1.0e-2, 1000)",
                 "ops.algorithm('Linear')",  # Single-step linear analysis
@@ -1324,7 +1327,7 @@ def _generate_analysis_script(analysis_sequence: list[str],
                 "    ops.wipeAnalysis()",
                 "    ops.system('UmfPack')",
                 "    ops.numberer('Plain')",
-                "    ops.constraints('Penalty', 1.0e14, 1.0e14)",
+                "    ops.constraints('Penalty', 1.0e12, 1.0e12)",
                 "    ops.integrator('LoadControl', 0.01)",
                 "    ops.test('NormUnbalance', 1.0e-2, 500)",
                 "    ops.algorithm('Newton')",
