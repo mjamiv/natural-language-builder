@@ -1,7 +1,7 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
 # NLB Web UI — Launch Script
-# Usage: bash ui/start.sh [--port 8080] [--no-reload]
+# Usage: bash ui/start.sh [--port 8080] [--no-reload] [--install-deps]
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -e
@@ -10,15 +10,35 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 PORT=8080
 RELOAD="--reload"
+INSTALL_DEPS=0
 
 # Parse args
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --port)   PORT="$2"; shift 2 ;;
-    --no-reload) RELOAD=""; shift ;;
-    *) echo "Unknown arg: $1"; exit 1 ;;
+    --port)
+      [[ -n "$2" ]] || { echo "--port requires a value"; exit 1; }
+      PORT="$2"
+      shift 2
+      ;;
+    --no-reload)
+      RELOAD=""
+      shift
+      ;;
+    --install-deps)
+      INSTALL_DEPS=1
+      shift
+      ;;
+    *)
+      echo "Unknown arg: $1"
+      exit 1
+      ;;
   esac
 done
+
+if ! [[ "$PORT" =~ ^[0-9]{1,5}$ ]] || (( PORT < 1 || PORT > 65535 )); then
+  echo "❌ Invalid port: $PORT (must be 1-65535)"
+  exit 1
+fi
 
 cd "$ROOT_DIR"
 
@@ -31,11 +51,22 @@ fi
 
 source .venv/bin/activate
 
-# ── Install/verify deps ─────────────────────────────────────────────────────
-echo "📦  Checking dependencies..."
-pip install -q fastapi "uvicorn[standard]" sse-starlette 2>/dev/null \
-  && echo "    ✓ fastapi, uvicorn, sse-starlette ready" \
-  || { echo "⚠️  pip install had issues — continuing anyway"; }
+# ── Verify deps (optional install) ──────────────────────────────────────────
+if [[ "$INSTALL_DEPS" == "1" ]]; then
+  echo "📦 Installing UI dependencies..."
+  pip install -q -r ui/requirements.txt \
+    && echo "    ✓ dependencies installed" \
+    || { echo "❌ dependency install failed"; exit 1; }
+else
+  python - <<'PY' >/dev/null || {
+import importlib
+for mod in ("fastapi", "uvicorn", "sse_starlette"):
+    importlib.import_module(mod)
+PY
+    echo "❌ Missing dependencies. Run: bash ui/start.sh --install-deps"
+    exit 1
+  }
+fi
 
 # ── Check server file exists ────────────────────────────────────────────────
 if [[ ! -f "ui/server.py" ]]; then

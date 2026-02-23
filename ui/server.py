@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import mimetypes
+import os
 from pathlib import Path
 from typing import Any, Optional
 
@@ -38,11 +39,20 @@ import ui.run_manager as rm
 
 app = FastAPI(title="NLB Web UI", version="1.0.0")
 
+# Restrictive CORS by default. Override with NLB_UI_ALLOW_ORIGINS env var
+# (comma-separated list, e.g. "https://app.example.com,http://localhost:8080").
+_ALLOWED_ORIGINS = [
+    origin.strip() for origin in os.getenv(
+        "NLB_UI_ALLOW_ORIGINS",
+        "http://localhost:8080,http://127.0.0.1:8080",
+    ).split(",") if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept"],
 )
 
 # ── Static files (served AFTER api routes) ────────────────────────────
@@ -89,6 +99,11 @@ class RunRequest(BaseModel):
 
 
 # ── API routes ────────────────────────────────────────────────────────
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 
 @app.get("/api/examples")
 def get_examples():

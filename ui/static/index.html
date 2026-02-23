@@ -940,7 +940,13 @@
       if (!r.ok) return;
       const data = await r.json();
       if (Array.isArray(data.examples) && data.examples.length) {
-        state.examples = [null, ...data.examples];
+        const mapped = data.examples.map(ex => {
+          if (typeof ex === 'string') return ex;
+          return ex?.description || ex?.label || '';
+        }).filter(Boolean);
+        if (!mapped.length) return;
+
+        state.examples = [null, ...mapped];
         Array.from(el.examples.options).forEach((opt, i) => {
           if (i > 0 && state.examples[i]) {
             opt.text = state.examples[i].slice(0, 80) + '…';
@@ -990,6 +996,14 @@
       .replace(/"/g, '&quot;');
   }
 
+  function sanitizeMarkdown(md) {
+    // Block raw HTML in markdown artifacts to prevent XSS in rendered modal.
+    return String(md)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+
   el.logClear.addEventListener('click', e => {
     e.preventDefault();
     el.logsBody.innerHTML = '';
@@ -1032,11 +1046,9 @@
       el.runIcon.textContent = '';
       el.runIcon.innerHTML = '<span class="spin">⟳</span>';
       el.runLabel.textContent = 'Running…';
-      addClass(el.btnCancel, 'hidden');
       removeClass(el.btnCancel, 'hidden');
       addClass(el.stepDot, 'pulsing');
       removeClass(el.progressPanel, 'hidden');
-      addClass(el.streamBadge, 'hidden');
       removeClass(el.streamBadge, 'hidden');
     } else {
       el.runIcon.textContent = '▶';
@@ -1058,7 +1070,9 @@
       try {
         const data = JSON.parse(evt.data);
         appendLog(data);
-        if (data.step) updateProgress(data.step, data.progress, data.elapsed);
+        if (typeof data.progress === 'number' || typeof data.elapsed === 'number') {
+          updateProgress(data.step || el.stepName.textContent, data.progress, data.elapsed);
+        }
       } catch (e) {
         appendLog({ ts: new Date().toISOString(), level: 'info', message: evt.data });
       }
@@ -1152,17 +1166,20 @@
     el.resultsContent.innerHTML = '';
 
     // Risk banner
-    const risk = results?.risk_rating || results?.risk || 'UNKNOWN';
+    const rawRisk = String(results?.risk_rating || results?.risk || 'UNKNOWN').toUpperCase();
+    const risk = ['RED', 'YELLOW', 'GREEN'].includes(rawRisk) ? rawRisk : 'UNKNOWN';
     const riskColor = { RED: 'var(--red)', YELLOW: 'var(--yellow)', GREEN: 'var(--green)' }[risk] || 'var(--text-dim)';
     const riskEmoji = { RED: '🔴', YELLOW: '🟡', GREEN: '🟢' }[risk] || '⚪';
+    const safeSummary = escHtml(results?.summary || 'Analysis complete');
+    const safeDescription = escHtml(results?.description || '');
 
     const banner = document.createElement('div');
     banner.className = `risk-banner ${risk}`;
     banner.innerHTML = `
       <span class="risk-badge ${risk}">${riskEmoji} ${risk}</span>
       <div class="risk-summary">
-        <strong>${results?.summary || 'Analysis complete'}</strong>
-        ${results?.description || ''}
+        <strong>${safeSummary}</strong>
+        ${safeDescription}
       </div>
     `;
     el.resultsContent.appendChild(banner);
@@ -1329,7 +1346,7 @@
     addTab('Open →', false);
     const pane2 = makePaneInactive();
     pane2.innerHTML = `<div style="padding:24px;font-size:13px;color:var(--text-dim);">
-      <a href="${escHtml(url)}" target="_blank" style="color:var(--accent);">Open in new tab ↗</a>
+      <a href="${escHtml(url)}" target="_blank" rel="noopener noreferrer" style="color:var(--accent);">Open in new tab ↗</a>
     </div>`;
   }
 
@@ -1338,7 +1355,8 @@
     const pane = makePaneActive();
     const div = document.createElement('div');
     div.className = 'md-content';
-    div.innerHTML = typeof marked !== 'undefined' ? marked.parse(md) : `<pre>${escHtml(md)}</pre>`;
+    const safeMd = sanitizeMarkdown(md);
+    div.innerHTML = typeof marked !== 'undefined' ? marked.parse(safeMd) : `<pre>${escHtml(safeMd)}</pre>`;
     pane.appendChild(div);
 
     addTab('Source', false);

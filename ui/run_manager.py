@@ -72,6 +72,10 @@ _runs_lock = threading.Lock()
 _sse_queues: Dict[str, List[asyncio.Queue]] = {}
 _sse_lock = threading.Lock()
 
+# nlb.cli monkey-patching is process-global; serialize patched execution
+# to avoid cross-run log leakage/races when multiple runs are active.
+_CLI_PATCH_LOCK = threading.Lock()
+
 # Shared executor
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="nlb-run")
 
@@ -438,8 +442,9 @@ def _run_pipeline_thread(run_id: str, description: str):
         parse_event = _make_log("info", "📝 Parsing description...", "parse")
         _append_log(run_id, parse_event)
 
-        with _LogCapture(run_id, step_tracker):
-            params = parse_description(description)
+        with _CLI_PATCH_LOCK:
+            with _LogCapture(run_id, step_tracker):
+                params = parse_description(description)
 
         spans = params.get("spans", [])
         btype = (params.get("bridge_type") or "unknown").replace("_", " ")
@@ -467,8 +472,9 @@ def _run_pipeline_thread(run_id: str, description: str):
         _update_run(run_id, step="parse", progress=8)
 
         # ── Steps 2-7: full pipeline with monkey-patching ─────────────
-        with _LogCapture(run_id, step_tracker):
-            results = run_pipeline(params, output_dir=output_dir, verbose=True)
+        with _CLI_PATCH_LOCK:
+            with _LogCapture(run_id, step_tracker):
+                results = run_pipeline(params, output_dir=output_dir, verbose=True)
 
         if results is None:
             raise RuntimeError("Pipeline returned None (superstructure step failed)")
@@ -581,5 +587,14 @@ def get_artifact_path(run_id: str, filename: str) -> Optional[Path]:
     run = _get_run(run_id)
     if run is None:
         return None
-    p = Path(run["output_dir"]) / filename
-    return p if p.exists() and p.is_file() else None
+
+    base = Path(run["output_dir"]).resolve()
+    candidate = (base / filename).resolve()
+
+    # Prevent path traversal outside the run output directory.
+    try:
+        candidate.relative_to(base)
+    except ValueError:
+        return None
+
+    return candidate if candidate.exists() and candidate.is_file() else None
