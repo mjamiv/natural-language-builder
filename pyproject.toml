@@ -39,6 +39,9 @@ viz = [
     "matplotlib>=3.7",
 ]
 
+[project.scripts]
+nlb = "nlb.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/mjamiv/natural-language-builder"
 Repository = "https://github.com/mjamiv/natural-language-builder"
