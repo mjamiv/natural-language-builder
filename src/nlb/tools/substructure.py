@@ -1350,6 +1350,15 @@ def build_seat_abutment(
         "transform": trans_tag,
     })
 
+    # Add rigid links from seat node to cap wing nodes
+    for cap_node in model.cap_nodes:
+        if cap_node != seat_node:
+            r_tag = tags.next()
+            model.elements.append({
+                "tag": r_tag, "type": "rigidLink",
+                "nodes": [seat_node, cap_node], "linkType": "beam",
+            })
+
     return model
 
 

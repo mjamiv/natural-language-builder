@@ -1343,6 +1343,14 @@ def build_spread_footing(
         "note": "Winkler model — compression only springs",
     }
 
+    # Boundary condition — fix base node (vertical springs provide stiffness,
+    # but base must be restrained against rigid body motion)
+    model.boundary_conditions.append({
+        "node": model.base_node,
+        "fixity": [0, 0, 0, 0, 0, 0],  # all DOFs fixed
+        "description": "Spread footing base — restrained by soil springs"
+    })
+
     return model
 
 

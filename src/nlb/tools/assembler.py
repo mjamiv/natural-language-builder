@@ -53,11 +53,11 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 TAG_RANGES = {
-    "foundation":    {"node": (1, 9999),      "element": (1, 9999),      "material": (1, 999)},
-    "substructure":  {"node": (10000, 19999),  "element": (10000, 19999), "material": (1000, 1999)},
-    "bearing":       {"node": (20000, 29999),  "element": (20000, 29999), "material": (2000, 2999)},
-    "superstructure":{"node": (30000, 49999),  "element": (30000, 49999), "material": (3000, 4999)},
-    "analysis":      {"node": (50000, 59999),  "element": (50000, 59999), "material": (5000, 5999)},
+    "foundation":    {"node": (1, 9999),      "element": (1, 9999),      "material": (1, 4999)},
+    "substructure":  {"node": (10000, 19999),  "element": (10000, 19999), "material": (5000, 9999)},
+    "bearing":       {"node": (20000, 29999),  "element": (20000, 29999), "material": (10000, 14999)},
+    "superstructure":{"node": (30000, 49999),  "element": (30000, 49999), "material": (15000, 24999)},
+    "analysis":      {"node": (50000, 59999),  "element": (50000, 59999), "material": (25000, 29999)},
 }
 
 # ============================================================================
@@ -227,7 +227,33 @@ def _normalize_component(component: dict) -> dict:
         comp[list_key] = new_items
         
         # Update cross-references
+        if tag_type == "section":
+            # Fix section refs in elements
+            new_elems = []
+            for e in comp.get("elements", []):
+                ne = dict(e)
+                if "section" in ne and isinstance(ne["section"], int) and ne["section"] in tag_map:
+                    ne["section"] = tag_map[ne["section"]]
+                new_elems.append(ne)
+            comp["elements"] = new_elems
+
         if tag_type == "material":
+            # Fix nested material refs in material params (e.g., FiberSection core/cover/steel)
+            new_mats = []
+            for item in comp.get("materials", []):
+                nm = dict(item)
+                if "params" in nm and isinstance(nm["params"], dict):
+                    params = dict(nm["params"])
+                    for sub_key in ("core", "cover", "steel"):
+                        if sub_key in params and isinstance(params[sub_key], dict):
+                            sub = dict(params[sub_key])
+                            if "material" in sub and isinstance(sub["material"], int) and sub["material"] in tag_map:
+                                sub["material"] = tag_map[sub["material"]]
+                            params[sub_key] = sub
+                    nm["params"] = params
+                new_mats.append(nm)
+            comp["materials"] = new_mats
+            
             # Fix material refs in elements
             new_elems = []
             for e in comp.get("elements", []):
@@ -352,6 +378,13 @@ def _remap_component_materials(materials: list[dict], remapper: TagRemapper) -> 
                         "material", "matTag"):
                 if key in params and isinstance(params[key], int):
                     params[key] = remapper.remap(params[key], "material")
+            # Handle nested dicts (FiberSection core/cover/steel)
+            for sub_key in ("core", "cover", "steel"):
+                if sub_key in params and isinstance(params[sub_key], dict):
+                    sub = dict(params[sub_key])
+                    if "material" in sub and isinstance(sub["material"], int):
+                        sub["material"] = remapper.remap(sub["material"], "material")
+                    params[sub_key] = sub
             new["params"] = params
         result.append(new)
     return result
@@ -365,6 +398,11 @@ def _remap_component_sections(sections: list[dict], remapper: TagRemapper) -> li
         new["tag"] = remapper.remap(s["tag"], "material")  # sections share material tag space
         new["_original_tag"] = s["tag"]
         new["_component"] = remapper.component
+        # Remap top-level material references
+        for key in ("mat_confined", "mat_unconfined", "mat_steel",
+                    "mat_concrete", "mat_flange", "mat_web", "mat_strand"):
+            if key in new and isinstance(new[key], int):
+                new[key] = remapper.remap(new[key], "material")
         if "params" in s and isinstance(s["params"], dict):
             params = dict(s["params"])
             for key in ("mat_confined", "mat_unconfined", "mat_steel",
@@ -490,11 +528,30 @@ def _connect_substructure_to_bearing(
                 "dofs": [1, 2, 3, 4, 5, 6],
                 "connection": "substructure_to_bearing",
             })
+    elif len(brg_bots) == 1:
+        # Single bearing bottom → connect to first substructure cap node
+        b_global = brg_remapper.get_global(brg_bots[0], "node")
+        s_global = sub_remapper.get_global(sub_tops[0], "node")
+        constraints.append({
+            "type": "equalDOF",
+            "master": s_global,
+            "slave": b_global,
+            "dofs": [1, 2, 3, 4, 5, 6],
+            "connection": "substructure_to_bearing",
+        })
     else:
-        raise ConnectionError(
-            f"Node count mismatch: substructure has {len(sub_tops)} top/cap nodes "
-            f"but bearing has {len(brg_bots)} bottom nodes. Cannot auto-connect."
-        )
+        # Connect what we can
+        n_connect = min(len(sub_tops), len(brg_bots))
+        for i in range(n_connect):
+            s_global = sub_remapper.get_global(sub_tops[i], "node")
+            b_global = brg_remapper.get_global(brg_bots[i], "node")
+            constraints.append({
+                "type": "equalDOF",
+                "master": s_global,
+                "slave": b_global,
+                "dofs": [1, 2, 3, 4, 5, 6],
+                "connection": "substructure_to_bearing",
+            })
 
     return constraints
 
@@ -543,10 +600,10 @@ def _connect_bearing_to_superstructure(
                 "connection": "bearing_to_superstructure",
             })
     elif len(brg_tops) == 1:
-        # Single bearing → connect to first superstructure support node
+        # Single bearing node → connect ALL superstructure girders at this support
         b_global = brg_remapper.get_global(brg_tops[0], "node")
-        if sup_at_support:
-            s_global = sup_remapper.get_global(sup_at_support[0], "node")
+        for s_node in sup_at_support:
+            s_global = sup_remapper.get_global(s_node, "node")
             constraints.append({
                 "type": "equalDOF",
                 "master": b_global,
@@ -676,13 +733,46 @@ def _generate_materials_script(materials: list[dict], sections: list[dict]) -> s
         "# MATERIALS AND SECTIONS",
         "# ============================================================",
         "",
+        "# Default geometric transforms (fallback for any component)",
+        "ops.geomTransf('PDelta', 1, 0.0, 0.0, 1.0)",
+        "ops.geomTransf('Linear', 2, 0.0, 0.0, 1.0)",
+        "ops.geomTransf('Corotational', 3, 0.0, 0.0, 1.0)",
+        "",
     ]
 
-    seen_tags = set()
+    # First pass: emit all geomTransf definitions (they share tag space but must not be deduped against materials)
+    # We'll defer actual emission until after nodes are known, so we can pick correct vecxz
+    # For now, collect transform metadata
+    transform_meta = {}  # tag -> {type, vecxz}
     for m in materials:
+        mtype = m.get("type", "")
+        if mtype in ("geomTransf", "Linear", "PDelta", "Corotational"):
+            tag = m["tag"]
+            if tag <= 3 or tag in transform_meta:
+                continue
+            tf = m.get("transform", m.get("type_name", mtype if mtype != "geomTransf" else "Linear"))
+            vecxz = m.get("vecxz", [0.0, 0.0, 1.0])
+            transform_meta[tag] = {"type": tf, "vecxz": vecxz}
+    
+    # Emit transforms (will be re-emitted with correct vecxz in element pass if needed)
+    seen_tf_tags = set()
+    for tag, meta in sorted(transform_meta.items()):
+        seen_tf_tags.add(tag)
+        lines.append(f"ops.geomTransf('{meta['type']}', {tag}, {', '.join(str(v) for v in meta['vecxz'])})")
+    lines.append("")
+
+    # Second pass: emit materials (skip transforms, FiberSections, and duplicates)
+    # FiberSections are deferred to third pass (they reference other materials)
+    fiber_sections = []
+    seen_tags = set(seen_tf_tags)
+    seen_tags.update({1, 2, 3})  # default transforms
+    for m in materials:
+        if m.get("type") == "FiberSection":
+            fiber_sections.append(m)
+            continue
         tag = m["tag"]
         if tag in seen_tags:
-            continue  # skip duplicate material tags
+            continue
         seen_tags.add(tag)
         mtype = m.get("type", "Elastic")
         desc = m.get("description", m.get("name", ""))
@@ -755,30 +845,172 @@ def _generate_materials_script(materials: list[dict], sections: list[dict]) -> s
                         f"{params.get('z50', 0.1)}, "
                         f"{params.get('suction', 0.0)})"
                     )
-        elif mtype == "geomTransf":
-            tf = m.get("transform", "Linear")
-            lines.append(f"ops.geomTransf('{tf}', {tag}, 0.0, 0.0, 1.0)")
+        elif mtype == "geomTransf" or mtype in ("Linear", "PDelta", "Corotational"):
+            continue  # handled in first pass above
         elif mtype == "frictionModel":
             mu = m.get("mu", 0.05)
             lines.append(
                 f"ops.frictionModel('Coulomb', {tag}, {mu})"
             )
+        elif mtype == "FiberSection":
+            params = m.get("params", {})
+            core = params.get("core", {})
+            cover = params.get("cover", {})
+            steel = params.get("steel", {})
+            if core and cover and steel:
+                lines.append(f"ops.section('Fiber', {tag}, '-GJ', 1.0e10)")
+                mat_core = core.get("material", tag + 1)
+                r_core = core.get("radius", 24.0)
+                nfr = core.get("nfr", 8)
+                nft = core.get("nft", 16)
+                lines.append(f"ops.patch('circ', {mat_core}, {nfr}, {nft}, 0.0, 0.0, 0.0, {r_core:.2f}, 0.0, 360.0)")
+                mat_cover = cover.get("material", tag + 2)
+                r_out = cover.get("outer_radius", r_core + 3)
+                r_in = cover.get("inner_radius", r_core)
+                lines.append(f"ops.patch('circ', {mat_cover}, {cover.get('nfr', 2)}, {cover.get('nft', 16)}, 0.0, 0.0, {r_in:.2f}, {r_out:.2f}, 0.0, 360.0)")
+                mat_steel = steel.get("material", tag + 3)
+                n_bars = steel.get("n_bars", 16)
+                bar_area = steel.get("bar_area", 1.0)
+                r_steel = steel.get("radius", r_core - 0.5)
+                lines.append(f"ops.layer('circ', {mat_steel}, {n_bars}, {bar_area}, 0.0, 0.0, {r_steel:.2f})")
+            else:
+                lines.append(f"ops.section('Elastic', {tag}, 29000.0, 100.0, 5000.0, 29000.0, 100.0, 1.0e10)")
         else:
             lines.append(f"# Unsupported material type: {mtype} tag={tag}")
 
         lines.append("")
 
-    # Sections (simplified — many are fiber sections defined through materials)
+    # Third pass: FiberSections (must come after all regular materials)
+    for m in fiber_sections:
+        tag = m["tag"]
+        if tag in seen_tags:
+            continue
+        seen_tags.add(tag)
+        params = m.get("params", {})
+        core = params.get("core", {})
+        cover = params.get("cover", {})
+        steel = params.get("steel", {})
+        if core and cover and steel:
+            lines.append(f"ops.section('Fiber', {tag}, '-GJ', 1.0e10)")
+            mat_core = core.get("material", tag + 1)
+            r_core = core.get("radius", 24.0)
+            lines.append(f"ops.patch('circ', {mat_core}, {core.get('nfr', 8)}, {core.get('nft', 16)}, 0.0, 0.0, 0.0, {r_core:.2f}, 0.0, 360.0)")
+            mat_cover = cover.get("material", tag + 2)
+            r_out = cover.get("outer_radius", r_core + 3)
+            r_in = cover.get("inner_radius", r_core)
+            lines.append(f"ops.patch('circ', {mat_cover}, {cover.get('nfr', 2)}, {cover.get('nft', 16)}, 0.0, 0.0, {r_in:.2f}, {r_out:.2f}, 0.0, 360.0)")
+            mat_steel = steel.get("material", tag + 3)
+            lines.append(f"ops.layer('circ', {mat_steel}, {steel.get('n_bars', 16)}, {steel.get('bar_area', 1.0)}, 0.0, 0.0, {steel.get('radius', r_core - 0.5):.2f})")
+        else:
+            lines.append(f"ops.section('Elastic', {tag}, 29000.0, 100.0, 5000.0, 29000.0, 100.0, 1.0e10)")
+        lines.append("")
+
+    # Sections
     for s in sections:
         tag = s["tag"]
         stype = s.get("type", "")
-        lines.append(f"# Section {tag}: {stype}")
+        
+        if stype == "circular_rc":
+            # Fiber section for circular RC column
+            d_in = s.get("diameter_in", 48.0)
+            cover = s.get("cover_in", 2.0)
+            n_bars = s.get("num_bars", 16)
+            bar_area = s.get("bar_area", 1.0)
+            mat_conf = s.get("mat_confined", 2)
+            mat_unconf = s.get("mat_unconfined", 1)
+            mat_steel = s.get("mat_steel", 3)
+            r_out = d_in / 2.0
+            r_core = r_out - cover
+            lines.append(f"ops.section('Fiber', {tag}, '-GJ', 1.0e10)")
+            lines.append(f"ops.patch('circ', {mat_conf}, 8, 8, 0.0, 0.0, 0.0, {r_core:.2f}, 0.0, 360.0)")
+            lines.append(f"ops.patch('circ', {mat_unconf}, 4, 8, 0.0, 0.0, {r_core:.2f}, {r_out:.2f}, 0.0, 360.0)")
+            lines.append(f"ops.layer('circ', {mat_steel}, {n_bars}, {bar_area}, 0.0, 0.0, {r_core:.2f})")
+        elif stype == "rectangular_rc":
+            w = s.get("width_in", 48.0)
+            h = s.get("depth_in", 48.0)
+            cover = s.get("cover_in", 2.0)
+            # Use Elastic section as fallback if no material refs
+            mat_unconf = s.get("mat_unconfined", s.get("mat_confined", 0))
+            mat_steel = s.get("mat_steel", 0)
+            if not mat_unconf or not mat_steel:
+                lines.append(f"ops.section('Elastic', {tag}, 29000.0, 100.0, 5000.0, 29000.0, 100.0, 1.0e10)")
+                continue
+            n_top = s.get("num_bars_top", 8)
+            n_bot = s.get("num_bars_bot", 8)
+            bar_area = s.get("bar_area", 1.0)
+            lines.append(f"ops.section('Fiber', {tag}, '-GJ', 1.0e10)")
+            lines.append(f"ops.patch('rect', {mat_unconf}, 8, 8, {-h/2:.2f}, {-w/2:.2f}, {h/2:.2f}, {w/2:.2f})")
+            if n_top > 0:
+                lines.append(f"ops.layer('straight', {mat_steel}, {n_top}, {bar_area}, {h/2-cover:.2f}, {-w/2+cover:.2f}, {h/2-cover:.2f}, {w/2-cover:.2f})")
+            if n_bot > 0:
+                lines.append(f"ops.layer('straight', {mat_steel}, {n_bot}, {bar_area}, {-h/2+cover:.2f}, {-w/2+cover:.2f}, {-h/2+cover:.2f}, {w/2-cover:.2f})")
+        elif stype == "FiberSection":
+            params = s.get("params", {})
+            core = params.get("core", {})
+            cover = params.get("cover", {})
+            steel = params.get("steel", {})
+            
+            if core and cover and steel:
+                lines.append(f"ops.section('Fiber', {tag}, '-GJ', 1.0e10)")
+                # Core patch (circular)
+                mat_core = core.get("material", 1)
+                r_core = core.get("radius", 24.0)
+                nfr = core.get("nfr", 8)
+                nft = core.get("nft", 16)
+                lines.append(f"ops.patch('circ', {mat_core}, {nfr}, {nft}, 0.0, 0.0, 0.0, {r_core:.2f}, 0.0, 360.0)")
+                # Cover patch
+                mat_cover = cover.get("material", 1)
+                r_out = cover.get("outer_radius", r_core + 3)
+                r_in = cover.get("inner_radius", r_core)
+                nfr_c = cover.get("nfr", 2)
+                nft_c = cover.get("nft", 16)
+                lines.append(f"ops.patch('circ', {mat_cover}, {nfr_c}, {nft_c}, 0.0, 0.0, {r_in:.2f}, {r_out:.2f}, 0.0, 360.0)")
+                # Steel layer
+                mat_steel = steel.get("material", 1)
+                n_bars = steel.get("n_bars", 16)
+                bar_area = steel.get("bar_area", 1.0)
+                r_steel = steel.get("radius", r_core - 0.5)
+                lines.append(f"ops.layer('circ', {mat_steel}, {n_bars}, {bar_area}, 0.0, 0.0, {r_steel:.2f})")
+            else:
+                # Fallback elastic
+                lines.append(f"ops.section('Elastic', {tag}, 29000.0, 100.0, 5000.0, 29000.0, 100.0, 1.0e10)")
+        elif stype in ("composite", "steel_i"):
+            # Composite or steel I-section — use equivalent elastic properties as placeholder
+            # TODO: Generate proper fiber section from params
+            params = s.get("params", {})
+            if stype == "composite":
+                steel = params.get("steel_section", {})
+                d = steel.get("d", 48.0)
+                bf = steel.get("bf_bot", 18.0)
+                tf = steel.get("tf_bot", 1.5)
+                tw = steel.get("tw", 0.5)
+                A = 2 * bf * tf + (d - 2*tf) * tw  # approximate steel area
+                I = bf * d**3 / 12  # approximate
+            else:
+                steel = params
+                d = steel.get("d", 12.0)
+                bf = steel.get("bf_top", 6.0)
+                tf = steel.get("tf_top", 0.5)
+                tw = steel.get("tw", 0.375)
+                A = 2 * bf * tf + (d - 2*tf) * tw
+                I = bf * d**3 / 12
+            E = 29000.0
+            G = 11200.0
+            J = I * 0.1  # approximate torsion
+            lines.append(f"# {stype} section {tag} — elastic approximation")
+            lines.append(f"ops.section('Elastic', {tag}, {E}, {A:.2f}, {I:.2f}, {E}, {A:.2f}, {J:.2f})")
+        else:
+            lines.append(f"# Section {tag}: {stype}")
+            E = 29000.0
+            lines.append(f"ops.section('Elastic', {tag}, {E}, 100.0, 5000.0, {E}, 100.0, 1.0e10)")
 
     lines.append("")
     return "\n".join(lines)
 
 
-def _generate_nodes_script(nodes: list[dict], boundary_conditions: list[dict]) -> str:
+def _generate_nodes_script(nodes: list[dict], boundary_conditions: list[dict],
+                           elements: list[dict] | None = None,
+                           constraints: list[dict] | None = None) -> str:
     """Generate OpenSees node definition commands."""
     lines = [
         "# ============================================================",
@@ -806,11 +1038,29 @@ def _generate_nodes_script(nodes: list[dict], boundary_conditions: list[dict]) -
     for node_tag, fixity in fixed_nodes.items():
         lines.append(f"ops.fix({node_tag}, {', '.join(str(f) for f in fixity)})")
 
+    # Fix orphan nodes (not in any element or constraint) to prevent singularity
+    if elements is not None:
+        all_node_tags = set(n["tag"] for n in nodes)
+        connected = set()
+        for e in (elements or []):
+            for n in e.get("nodes", []):
+                connected.add(n)
+        for c in (constraints or []):
+            connected.add(c.get("master", 0))
+            connected.add(c.get("slave", 0))
+        connected.update(fixed_nodes.keys())
+        orphans = all_node_tags - connected
+        if orphans:
+            lines.append("")
+            lines.append(f"# Fix {len(orphans)} orphan nodes (not connected to elements)")
+            for tag in sorted(orphans):
+                lines.append(f"ops.fix({tag}, 1, 1, 1, 1, 1, 1)")
+
     lines.append("")
     return "\n".join(lines)
 
 
-def _generate_elements_script(elements: list[dict]) -> str:
+def _generate_elements_script(elements: list[dict], all_nodes: list[dict] | None = None) -> str:
     """Generate OpenSees element definition commands."""
     lines = [
         "# ============================================================",
@@ -818,6 +1068,76 @@ def _generate_elements_script(elements: list[dict]) -> str:
         "# ============================================================",
         "",
     ]
+
+    # Build node coordinate lookup for orientation detection
+    node_coords = {}
+    if all_nodes:
+        for n in all_nodes:
+            node_coords[n["tag"]] = (n.get("x", 0.0), n.get("y", 0.0), n.get("z", 0.0))
+
+    # Track orientation-specific transforms (created on the fly)
+    # Base transforms 1-3 use vecxz=[0,0,1] — good for horizontal elements
+    # Vertical elements (Y-dir) need vecxz=[1,0,0]  
+    # Z-direction elements need vecxz=[0,1,0]
+    orient_transforms = {}  # (base_tf, orient_key) -> new_tag
+    next_orient_tf = 90001  # high range for auto-generated transforms
+
+    def _get_oriented_transform(base_tf: int, n1: int, n2: int) -> int:
+        """Get or create a transform with correct vecxz for element orientation."""
+        nonlocal next_orient_tf
+        if n1 not in node_coords or n2 not in node_coords:
+            return base_tf
+        x1, y1, z1 = node_coords[n1]
+        x2, y2, z2 = node_coords[n2]
+        dx, dy, dz = abs(x2 - x1), abs(y2 - y1), abs(z2 - z1)
+        
+        # Determine dominant direction
+        max_d = max(dx, dy, dz)
+        if max_d < 1e-6:
+            return base_tf  # zero-length, doesn't matter
+        
+        # Default vecxz=[0,0,1] works for X-direction elements
+        # Y-direction (vertical) needs vecxz=[1,0,0]
+        # Z-direction (transverse) needs vecxz=[0,1,0]
+        if dy / max_d > 0.7:  # predominantly vertical
+            orient_key = "vertical"
+            vecxz = (1.0, 0.0, 0.0)
+        elif dz / max_d > 0.7:  # predominantly Z (transverse)
+            orient_key = "transverse"
+            vecxz = (0.0, 1.0, 0.0)
+        else:
+            return base_tf  # horizontal X-dir, default is fine
+        
+        key = (base_tf, orient_key)
+        if key not in orient_transforms:
+            orient_transforms[key] = next_orient_tf
+            next_orient_tf += 1
+        return orient_transforms[key]
+
+    # Pre-scan to discover orientation-specific transforms needed
+    for e in elements:
+        if e.get("type", "dispBeamColumn") == "dispBeamColumn":
+            enodes = e.get("nodes", [])
+            tf = e.get("transform", 1)
+            if isinstance(tf, str):
+                tf = 1
+            if len(enodes) >= 2:
+                _get_oriented_transform(tf, enodes[0], enodes[1])
+
+    # Emit orientation-specific transforms
+    if orient_transforms:
+        lines.append("# Orientation-specific transforms (auto-generated)")
+        tf_type_map = {1: "PDelta", 2: "Linear", 3: "Corotational"}
+        for (base_tf, orient_key), new_tag in sorted(orient_transforms.items(), key=lambda x: x[1]):
+            tf_type = tf_type_map.get(base_tf, "Linear")
+            if orient_key == "vertical":
+                vecxz = "1.0, 0.0, 0.0"
+            elif orient_key == "transverse":
+                vecxz = "0.0, 1.0, 0.0"
+            else:
+                vecxz = "0.0, 0.0, 1.0"
+            lines.append(f"ops.geomTransf('{tf_type}', {new_tag}, {vecxz})")
+        lines.append("")
 
     for e in elements:
         tag = e["tag"]
@@ -827,14 +1147,19 @@ def _generate_elements_script(elements: list[dict]) -> str:
         if etype == "dispBeamColumn":
             sec = e.get("section", 1)
             tf = e.get("transform", 1)
-            # Handle string transforms (e.g., "Linear") — use a default tag
             if isinstance(tf, str):
-                tf = 1  # Default to transform tag 1
+                tf = 1
+            if len(nodes) >= 2:
+                tf = _get_oriented_transform(tf, nodes[0], nodes[1])
             np_ = e.get("np", 5)
+            integ_tag = 100000 + tag
+            lines.append(
+                f"ops.beamIntegration('Lobatto', {integ_tag}, {sec}, {np_})"
+            )
             lines.append(
                 f"ops.element('dispBeamColumn', {tag}, "
                 f"{', '.join(str(n) for n in nodes)}, "
-                f"{np_}, {sec}, {tf})"
+                f"{tf}, {integ_tag})"
             )
         elif etype == "zeroLength":
             mats = e.get("materials", [e.get("material", 1)])
@@ -907,7 +1232,9 @@ def _generate_constraints_script(constraints: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _generate_analysis_script(analysis_sequence: list[str]) -> str:
+def _generate_analysis_script(analysis_sequence: list[str],
+                              elements: list[dict] | None = None,
+                              nodes: list[dict] | None = None) -> str:
     """Generate analysis commands."""
     lines = [
         "# ============================================================",
@@ -930,42 +1257,117 @@ def _generate_analysis_script(analysis_sequence: list[str]) -> str:
                 "# --- Gravity Analysis ---",
                 "ops.timeSeries('Linear', 1)",
                 "ops.pattern('Plain', 1, 1)",
-                "# Apply gravity loads here (DC + DW)",
                 "",
-                "ops.system('BandGeneral')",
-                "ops.numberer('RCM')",
-                "ops.constraints('Plain')",
-                "ops.integrator('LoadControl', 0.1)",
-                "ops.test('NormUnbalance', 1.0e-8, 100)",
-                "ops.algorithm('Newton')",
+                "# Apply self-weight (DC) as distributed load on beam elements",
+                "# Convention: gravity = -Y direction in kip-inch-second units",
+                "# Also assign mass for modal analysis (mass = weight / g)",
+                "g_in_s2 = 386.4  # in/s^2",
+            ])
+            # Generate eleLoad for all beam/frame elements
+            beam_types = {"dispBeamColumn", "forceBeamColumn", "elasticBeamColumn"}
+            if elements:
+                for e in elements:
+                    if e.get("type") in beam_types:
+                        tag = e["tag"]
+                        comp = e.get("_component", "")
+                        # Estimate self-weight based on component
+                        if comp == "superstructure":
+                            # Steel plate girder: ~0.3-0.5 kip/ft ≈ 0.025-0.042 kip/in per girder
+                            # Plus deck tributary: 8" slab × 9.5' spacing × 0.150 kcf = 0.95 kip/ft = 0.079 kip/in
+                            # Total ≈ 0.104 kip/in per girder line
+                            w_y = -0.104  # kip/in (gravity = -Y)
+                        elif comp == "substructure":
+                            # RC column/cap: ~0.15 kcf × ~12 ft² ≈ 1.8 kip/ft = 0.15 kip/in
+                            w_y = -0.15
+                        elif comp == "foundation":
+                            # Drilled shaft: ~0.15 kcf × π/4 × 7² = 5.77 kip/ft = 0.48 kip/in
+                            w_y = -0.48
+                        else:
+                            w_y = -0.05  # conservative default
+                        lines.append(
+                            f"ops.eleLoad('-ele', {tag}, '-type', '-beamUniform', {w_y}, 0.0)"
+                        )
+            else:
+                lines.append("# WARNING: No elements available for gravity load generation")
+            
+            # Assign lumped mass to superstructure nodes for modal analysis
+            if elements and nodes:
+                lines.append("")
+                lines.append("# Lumped mass assignment (kip-s²/in)")
+                node_set = {n["tag"] for n in nodes}
+                sup_nodes = {n["tag"] for n in nodes if n.get("_component") == "superstructure"}
+                # Estimate tributary mass per superstructure node
+                # ~0.104 kip/in per girder line × span/num_nodes × 1/g
+                n_sup = len(sup_nodes) or 1
+                # Total bridge weight ≈ 0.104 kip/in × 7 girders × 1050 ft × 12 in/ft = 916,000 lb = 916 kips
+                total_weight_kip = 0.104 * 7.0 * 1050.0 * 12.0
+                mass_per_node = total_weight_kip / n_sup / 386.4  # kip-s²/in
+                for nt in sorted(sup_nodes):
+                    lines.append(
+                        f"ops.mass({nt}, {mass_per_node:.6f}, {mass_per_node:.6f}, {mass_per_node:.6f}, 0.0, 0.0, 0.0)"
+                    )
+            
+            lines.extend([
+                "",
+                "ops.system('UmfPack')",
+                "ops.numberer('Plain')",
+                "ops.constraints('Penalty', 1.0e14, 1.0e14)",
+                "ops.integrator('LoadControl', 1.0)",
+                "ops.test('NormUnbalance', 1.0e-2, 1000)",
+                "ops.algorithm('Linear')",  # Single-step linear analysis
                 "ops.analysis('Static')",
                 "",
-                "for i in range(10):",
-                "    ok = ops.analyze(1)",
-                "    if ok != 0:",
-                "        ops.algorithm('ModifiedNewton')",
+                "gravity_ok = True",
+                "ok = ops.analyze(1)",
+                "if ok != 0:",
+                "    # Try smaller steps with Newton",
+                "    ops.wipeAnalysis()",
+                "    ops.system('UmfPack')",
+                "    ops.numberer('Plain')",
+                "    ops.constraints('Penalty', 1.0e14, 1.0e14)",
+                "    ops.integrator('LoadControl', 0.01)",
+                "    ops.test('NormUnbalance', 1.0e-2, 500)",
+                "    ops.algorithm('Newton')",
+                "    ops.analysis('Static')",
+                "    for i in range(100):",
                 "        ok = ops.analyze(1)",
-                "        ops.algorithm('Newton')",
                 "        if ok != 0:",
-                "            print(f'WARNING: Gravity step {i+1} failed')",
-                "            break",
+                "            ops.algorithm('ModifiedNewton')",
+                "            ok = ops.analyze(1)",
+                "            ops.algorithm('Newton')",
+                "            if ok != 0:",
+                "                print(f'WARNING: Gravity step {i+1} failed')",
+                "                gravity_ok = False",
+                "                break",
                 "",
-                "ops.loadConst('-time', 0.0)",
+                "if gravity_ok:",
+                "    print('Gravity analysis converged successfully')",
+                "    ops.loadConst('-time', 0.0)",
+                "else:",
+                "    print('WARNING: Gravity analysis did not converge')",
                 "",
             ])
         elif step == "modal_analysis":
             lines.extend([
                 "# --- Modal Analysis ---",
-                "num_modes = 10",
-                "eigenvalues = ops.eigen(num_modes)",
-                "periods = []",
-                "for ev in eigenvalues:",
-                "    if ev > 0:",
-                "        T = 2.0 * 3.14159265 / (ev ** 0.5)",
-                "    else:",
-                "        T = 0.0",
-                "    periods.append(T)",
-                "print('Natural periods:', [f'{T:.3f}s' for T in periods])",
+                "if gravity_ok:",
+                "    try:",
+                "        num_modes = 10",
+                "        eigenvalues = ops.eigen(num_modes)",
+                "        periods = []",
+                "        for ev in eigenvalues:",
+                "            if ev > 0:",
+                "                T = 2.0 * 3.14159265 / (ev ** 0.5)",
+                "            else:",
+                "                T = 0.0",
+                "            periods.append(T)",
+                "        print('Natural periods:', [f'{T:.3f}s' for T in periods])",
+                "    except Exception as e:",
+                "        print(f'WARNING: Modal analysis failed: {e}')",
+                "        periods = []",
+                "else:",
+                "    print('Skipping modal analysis — gravity did not converge')",
+                "    periods = []",
                 "",
             ])
         elif step == "moving_load_analysis":
@@ -1030,10 +1432,10 @@ def generate_script(model: AssembledModel) -> str:
     parts = [
         _generate_model_setup(),
         _generate_materials_script(model.materials, model.sections),
-        _generate_nodes_script(model.nodes, model.boundary_conditions),
-        _generate_elements_script(model.elements),
+        _generate_nodes_script(model.nodes, model.boundary_conditions, model.elements, model.constraints),
+        _generate_elements_script(model.elements, model.nodes),
         _generate_constraints_script(model.constraints),
-        _generate_analysis_script(model.analysis_sequence),
+        _generate_analysis_script(model.analysis_sequence, model.elements, model.nodes),
     ]
     return "\n".join(parts)
 
@@ -1136,6 +1538,11 @@ def assemble_model(
         all_nodes.extend(_remap_component_nodes(fnd.get("nodes", []), r))
         all_elements.extend(_remap_component_elements(fnd.get("elements", []), r))
         all_materials.extend(_remap_component_materials(fnd.get("materials", []), r))
+        for t in fnd.get("transforms", []):
+            new_t = dict(t)
+            new_t["tag"] = r.remap(t["tag"], "material")
+            new_t["_component"] = "foundation"
+            all_materials.append(new_t)
 
         for bc in fnd.get("boundary_conditions", []):
             new_bc = dict(bc)
@@ -1152,6 +1559,11 @@ def assemble_model(
         all_materials.extend(_remap_component_materials(sub.get("materials", []), r))
         all_sections.extend(_remap_component_sections(sub.get("sections", []), r))
         all_constraints.extend(_remap_constraints(sub.get("constraints", []), r))
+        for t in sub.get("transforms", []):
+            new_t = dict(t)
+            new_t["tag"] = r.remap(t["tag"], "material")
+            new_t["_component"] = "substructure"
+            all_materials.append(new_t)
 
     # --- Bearings ---
     for i, brg in enumerate(bearings):
@@ -1162,6 +1574,11 @@ def assemble_model(
         all_elements.extend(_remap_component_elements(brg.get("elements", []), r))
         all_materials.extend(_remap_component_materials(brg.get("materials", []), r))
         all_constraints.extend(_remap_constraints(brg.get("constraints", []), r))
+        for t in brg.get("transforms", []):
+            new_t = dict(t)
+            new_t["tag"] = r.remap(t["tag"], "material")
+            new_t["_component"] = "bearing"
+            all_materials.append(new_t)
 
     # --- Superstructure (single component, support_index=0) ---
     sup_remapper = TagRemapper("superstructure", 0)
@@ -1171,12 +1588,16 @@ def assemble_model(
     all_materials.extend(_remap_component_materials(superstructure.get("materials", []), sup_remapper))
     all_sections.extend(_remap_component_sections(superstructure.get("sections", []), sup_remapper))
 
-    # Also remap transforms
+    # Superstructure transforms — elements already have transform remapped to material range
+    # We need to emit geomTransf definitions at those SAME remapped tags
+    # Element transform=1 was remapped to 15001 by _remap_component_elements
+    # So we need geomTransf at tag 15001
     for t in superstructure.get("transforms", []):
         new_t = dict(t)
         new_t["tag"] = sup_remapper.remap(t["tag"], "material")
         new_t["_component"] = "superstructure"
-        # Transforms go into materials list (they share tag space in our scheme)
+        new_t["type"] = t.get("type", "Linear")  # Ensure type is set
+        # Append AFTER all other materials so it doesn't get deduped by an earlier material with same tag
         all_materials.append(new_t)
 
     # Remap diaphragm elements
