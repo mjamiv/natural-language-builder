@@ -117,6 +117,7 @@ class AnalysisResults:
         controlling_cases: [{element, check, dcr, combo, description}]
     """
     envelopes: dict = field(default_factory=dict)
+    moving_load_envelopes: dict = field(default_factory=dict)
     dcr: dict = field(default_factory=dict)
     reactions: dict = field(default_factory=dict)
     displacements: dict = field(default_factory=dict)
@@ -1390,11 +1391,191 @@ def _generate_analysis_script(analysis_sequence: list[str],
                 "",
             ])
         elif step == "moving_load_analysis":
+            # Collect superstructure element and node tags for the generated script
+            sup_ele_tags = []
+            sup_node_tags = set()
+            beam_types = {"dispBeamColumn", "forceBeamColumn", "elasticBeamColumn"}
+            if elements:
+                for e in elements:
+                    if e.get("_component") == "superstructure" and e.get("type") in beam_types:
+                        sup_ele_tags.append(e["tag"])
+                        for nref in e.get("nodes", []):
+                            sup_node_tags.add(nref)
+            sup_node_list = sorted(sup_node_tags)
             lines.extend([
                 "# --- Moving Load Analysis (HL-93) ---",
-                "# Influence line analysis at tenth-points",
-                "# (Implemented via unit load traversal)",
-                "print('Moving load analysis: placeholder')",
+                "# AASHTO 3.6.1.2: Truck + Lane, Tandem + Lane envelopes",
+                "# IM = 33% on truck/tandem only",
+                "",
+                "if gravity_ok:",
+                "    import math as _ml_math",
+                "",
+                f"    _ml_sup_nodes = {sup_node_list!r}",
+                f"    _ml_sup_eles = {sup_ele_tags!r}",
+                "",
+                "    # Sort superstructure nodes by X coordinate",
+                "    _ml_node_x = []",
+                "    for _nt in _ml_sup_nodes:",
+                "        try:",
+                "            _c = ops.nodeCoord(_nt)",
+                "            _ml_node_x.append((_nt, _c[0]))",
+                "        except Exception:",
+                "            pass",
+                "    _ml_node_x.sort(key=lambda p: p[1])",
+                "",
+                "    if len(_ml_node_x) >= 2:",
+                "        _ml_x_min = _ml_node_x[0][1]",
+                "        _ml_x_max = _ml_node_x[-1][1]",
+                "        _ml_bridge_len = _ml_x_max - _ml_x_min",
+                "    else:",
+                "        _ml_bridge_len = 0.0",
+                "",
+                "    # HL-93 vehicle definitions (forces in kip, positions in inches)",
+                "    _IM = 0.33",
+                "    # Design Truck: 8k front, 32k middle (14ft), 32k rear (28ft) — min spacing",
+                "    _truck_axles = [",
+                "        (8.0 * (1 + _IM), 0.0),",
+                "        (32.0 * (1 + _IM), 14.0 * 12.0),",
+                "        (32.0 * (1 + _IM), 28.0 * 12.0),",
+                "    ]",
+                "    # Design Tandem: two 25k axles, 4ft apart",
+                "    _tandem_axles = [",
+                "        (25.0 * (1 + _IM), 0.0),",
+                "        (25.0 * (1 + _IM), 4.0 * 12.0),",
+                "    ]",
+                "    # Lane load: 0.64 klf = 0.64/12 kip/in (no IM)",
+                "    _lane_w = 0.64 / 12.0",
+                "",
+                "    def _ml_nearest_node(x_target):",
+                "        best_nt = _ml_node_x[0][0]",
+                "        best_d = abs(_ml_node_x[0][1] - x_target)",
+                "        for nt, nx in _ml_node_x:",
+                "            d = abs(nx - x_target)",
+                "            if d < best_d:",
+                "                best_d = d",
+                "                best_nt = nt",
+                "        return best_nt",
+                "",
+                "    # Initialize envelope storage: per element, 12 DOF (i+j ends)",
+                "    _ml_env_max = {}",
+                "    _ml_env_min = {}",
+                "    _ml_ctrl = {}  # controlling position labels",
+                "    for _et in _ml_sup_eles:",
+                "        _ml_env_max[_et] = None",
+                "        _ml_env_min[_et] = None",
+                "        _ml_ctrl[_et] = {'max_moment': '', 'max_shear': ''}",
+                "",
+                "    _ml_n_pos = max(int(_ml_bridge_len / (sum([1]) * 12.0) + 0.5), 20) if _ml_bridge_len > 0 else 0",
+                "    # Use L/50 spacing approximately, minimum 20 positions",
+                "    if _ml_bridge_len > 0:",
+                "        _ml_n_pos = max(20, int(_ml_bridge_len / (_ml_bridge_len / 50.0)))",
+                "        _ml_step = _ml_bridge_len / (_ml_n_pos + 1)",
+                "    else:",
+                "        _ml_n_pos = 0",
+                "        _ml_step = 0",
+                "",
+                "    _ml_pos_count = 0",
+                "    _ml_ts_base = 900  # time series tag base to avoid collision",
+                "",
+                "    for _veh_name, _axles in [('HL93_Truck', _truck_axles), ('HL93_Tandem', _tandem_axles)]:",
+                "        for _pi in range(_ml_n_pos):",
+                "            _front_x = _ml_x_min + _ml_step * (_pi + 1)",
+                "",
+                "            # Reset analysis state for this load position",
+                "            ops.wipeAnalysis()",
+                "",
+                "            _ts_tag = _ml_ts_base + _ml_pos_count",
+                "            _pat_tag = _ml_ts_base + _ml_pos_count",
+                "            _ml_pos_count += 1",
+                "",
+                "            ops.timeSeries('Linear', _ts_tag)",
+                "            ops.pattern('Plain', _pat_tag, _ts_tag)",
+                "",
+                "            # Apply axle loads at nearest nodes",
+                "            _loaded_nodes = set()",
+                "            for _force_kip, _spacing_in in _axles:",
+                "                _x_axle = _front_x - _spacing_in",
+                "                if _ml_x_min <= _x_axle <= _ml_x_max:",
+                "                    _nn = _ml_nearest_node(_x_axle)",
+                "                    if _nn not in _loaded_nodes:",
+                "                        ops.load(_nn, 0.0, -_force_kip, 0.0, 0.0, 0.0, 0.0)",
+                "                        _loaded_nodes.add(_nn)",
+                "                    else:",
+                "                        # Multiple axles on same node — add force",
+                "                        ops.load(_nn, 0.0, -_force_kip, 0.0, 0.0, 0.0, 0.0)",
+                "",
+                "            # Apply lane load on all superstructure elements",
+                "            for _et in _ml_sup_eles:",
+                "                try:",
+                "                    ops.eleLoad('-ele', _et, '-type', '-beamUniform', -_lane_w, 0.0)",
+                "                except Exception:",
+                "                    pass",
+                "",
+                "            # Run static analysis for this position",
+                "            ops.system('UmfPack')",
+                "            ops.numberer('Plain')",
+                "            ops.constraints('Penalty', 1.0e12, 1.0e12)",
+                "            ops.integrator('LoadControl', 1.0)",
+                "            ops.test('NormUnbalance', 1.0e-2, 100)",
+                "            ops.algorithm('Linear')",
+                "            ops.analysis('Static')",
+                "            _ok = ops.analyze(1)",
+                "",
+                "            if _ok == 0:",
+                "                _pos_label = f'{_veh_name}_pos{_pi}'",
+                "                for _et in _ml_sup_eles:",
+                "                    try:",
+                "                        _f = ops.eleForce(_et)",
+                "                        if _f and len(_f) >= 6:",
+                "                            _fl = list(_f)",
+                "                            if _ml_env_max[_et] is None:",
+                "                                _ml_env_max[_et] = list(_fl)",
+                "                                _ml_env_min[_et] = list(_fl)",
+                "                            else:",
+                "                                for _i in range(len(_fl)):",
+                "                                    if _fl[_i] > _ml_env_max[_et][_i]:",
+                "                                        _ml_env_max[_et][_i] = _fl[_i]",
+                "                                    if _fl[_i] < _ml_env_min[_et][_i]:",
+                "                                        _ml_env_min[_et][_i] = _fl[_i]",
+                "                            # Track controlling for moment and shear",
+                "                            _m_abs = max(abs(_fl[2]) if len(_fl)>2 else 0, abs(_fl[5]) if len(_fl)>5 else 0)",
+                "                            _v_abs = max(abs(_fl[1]) if len(_fl)>1 else 0, abs(_fl[4]) if len(_fl)>4 else 0)",
+                "                            _prev_m = 0",
+                "                            _prev_v = 0",
+                "                            _em = _ml_env_max[_et]",
+                "                            if _em:",
+                "                                _prev_m = max(abs(_em[2]) if len(_em)>2 else 0, abs(_em[5]) if len(_em)>5 else 0)",
+                "                                _prev_v = max(abs(_em[1]) if len(_em)>1 else 0, abs(_em[4]) if len(_em)>4 else 0)",
+                "                            if _m_abs >= _prev_m:",
+                "                                _ml_ctrl[_et]['max_moment'] = _pos_label",
+                "                            if _v_abs >= _prev_v:",
+                "                                _ml_ctrl[_et]['max_shear'] = _pos_label",
+                "                    except Exception:",
+                "                        pass",
+                "",
+                "            # Remove pattern so next position starts clean",
+                "            ops.remove('loadPattern', _pat_tag)",
+                "            ops.remove('timeSeries', _ts_tag)",
+                "",
+                "    # Store moving load envelope results in a dict for extraction",
+                "    _ml_results = {}",
+                "    _labels = ['N_i','Vy_i','Vz_i','T_i','My_i','Mz_i','N_j','Vy_j','Vz_j','T_j','My_j','Mz_j']",
+                "    for _et in _ml_sup_eles:",
+                "        if _ml_env_max[_et] is not None:",
+                "            _env_dict = {}",
+                "            for _i, _lb in enumerate(_labels):",
+                "                if _i < len(_ml_env_max[_et]):",
+                "                    _env_dict[_lb] = {",
+                "                        'max': _ml_env_max[_et][_i],",
+                "                        'min': _ml_env_min[_et][_i],",
+                "                        'controlling_combo': 'HL93',",
+                "                    }",
+                "            _ml_results[str(_et)] = _env_dict",
+                "",
+                "    print(f'Moving load analysis: {_ml_pos_count} positions evaluated, {len(_ml_results)} elements enveloped')",
+                "else:",
+                "    _ml_results = {}",
+                "    print('Skipping moving load — gravity did not converge')",
                 "",
             ])
         elif step == "response_spectrum_analysis":
@@ -2026,6 +2207,26 @@ for tag_s, env in results["envelopes"].items():
 controlling.sort(key=lambda x: abs(x.get("dcr", 0)), reverse=True)
 results["controlling"] = controlling[:20]
 
+# Merge moving load envelopes
+try:
+    if _ml_results:
+        results["moving_load_envelopes"] = _ml_results
+        # Also merge HL-93 controlling into the main envelopes
+        for tag_s, ml_env in _ml_results.items():
+            if tag_s not in results["envelopes"]:
+                results["envelopes"][tag_s] = {}
+            for ft, vals in ml_env.items():
+                grav = results["envelopes"][tag_s].get(ft, {})
+                grav_max = grav.get("max", 0)
+                grav_min = grav.get("min", 0)
+                ml_max = vals.get("max", 0)
+                ml_min = vals.get("min", 0)
+                # Keep the worse envelope
+                if abs(ml_max) > abs(grav_max) or abs(ml_min) > abs(grav_min):
+                    results["envelopes"][tag_s][ft + "_HL93"] = vals
+except NameError:
+    pass  # _ml_results not defined (moving load step was skipped)
+
 print("__NLB_RESULTS__")
 print(json.dumps(results))
 '''
@@ -2079,6 +2280,7 @@ print(json.dumps(results))
             results.envelopes = {int(k): v for k, v in data.get("envelopes", {}).items()}
             results.modal = {int(k): v for k, v in data.get("modal", {}).items()}
             results.dcr = {int(k): v for k, v in data.get("dcr", {}).items()}
+            results.moving_load_envelopes = {int(k): v for k, v in data.get("moving_load_envelopes", {}).items()}
             results.controlling_cases = data.get("controlling", [])
 
             logger.info("Analysis complete — %d nodes, %d elements, %d modes, %d reactions",
