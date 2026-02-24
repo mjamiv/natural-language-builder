@@ -1,0 +1,15 @@
+[Unit]
+Description=NLB Web UI - Natural Language Bridge Analyzer
+After=network.target
+
+[Service]
+Type=simple
+User=moltbot
+WorkingDirectory=/tmp/natural-language-builder
+ExecStart=/tmp/natural-language-builder/.venv/bin/python -m uvicorn ui.server:app --host 0.0.0.0 --port 8080 --log-level warning
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONPATH=/tmp/natural-language-builder/src
+
+[Install]
+WantedBy=multi-user.target

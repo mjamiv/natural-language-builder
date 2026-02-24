@@ -390,23 +390,17 @@ def run_pipeline(params: dict, output_dir: Path | None = None, verbose: bool = F
     try:
         from nlb.tools.red_team import run_red_team
         
-        # Build element results from analysis envelopes/DCRs
-        element_results = []
-        dcr_data = analysis_dict.get("dcr", {})
-        for elem_tag, checks in dcr_data.items():
-            for check_name, dcr_val in checks.items():
-                element_results.append({
-                    "element": elem_tag,
-                    "check": check_name,
-                    "dcr": dcr_val,
-                    "demand": dcr_val * 100,  # placeholder
-                    "capacity": 100,
-                    "combo": "Strength I",
-                    "location": f"Element {elem_tag}",
-                })
+        # Pass raw analysis results + model to red team
+        # It will auto-compute real DCRs from forces + section capacities
+        model_dict = dict(results.get("model", {}))
+        # Inject superstructure sections so red team can compute girder capacities
+        super_sects = results.get("superstructure", {}).get("sections", [])
+        if super_sects:
+            model_dict["superstructure_sections"] = super_sects
         
         red_team_obj = run_red_team(
-            element_results=element_results,
+            analysis_results=analysis_dict,
+            model=model_dict,
             site_constraints={"constraints": params.get("constraints", [])},
         )
         red_dict = _model_to_dict(red_team_obj)

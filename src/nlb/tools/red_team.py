@@ -1191,41 +1191,99 @@ def _get_section_capacity(section: dict, fy_ksi: float = 50.0) -> dict:
     """Extract or estimate capacity values from a section dict.
 
     Returns dict with phi_Mn, phi_Vn, phi_Pn (all in kip-inch units).
+    Handles both flat sections and nested I-beam geometry.
     """
     cap: dict = {}
 
-    # --- Flexural capacity: φMn = 0.9 × Fy × Zx ---
-    Zx = section.get("Zx", 0.0) or section.get("zx", 0.0)
-    Sx = section.get("Sx", 0.0) or section.get("sx", 0.0)
-    Ix = section.get("Ix", 0.0) or section.get("ix", 0.0)
-    depth = section.get("d", 0.0) or section.get("depth", 0.0)
-    area = section.get("A", 0.0) or section.get("area", 0.0)
+    # Extract dimensions — check multiple possible key names
+    depth = (section.get("d", 0.0) or section.get("depth", 0.0)
+             or section.get("depth_in", 0.0) or 0.0)
+    tw = section.get("tw", 0.0) or 0.0
+    bf_top = section.get("bf_top", 0.0) or section.get("bf", 0.0) or 0.0
+    tf_top = section.get("tf_top", 0.0) or section.get("tf", 0.0) or 0.0
+    bf_bot = section.get("bf_bot", 0.0) or bf_top
+    tf_bot = section.get("tf_bot", 0.0) or tf_top
+    area = section.get("A", 0.0) or section.get("area", 0.0) or 0.0
+    Zx = section.get("Zx", 0.0) or section.get("zx", 0.0) or 0.0
+    Sx = section.get("Sx", 0.0) or section.get("sx", 0.0) or 0.0
+    Ix = section.get("Ix", 0.0) or section.get("ix", 0.0) or 0.0
 
+    # If we have I-beam geometry but no Zx, compute it
+    if Zx == 0 and depth > 0 and tw > 0 and tf_top > 0:
+        # Compute area if not provided
+        if area == 0:
+            area = bf_top * tf_top + bf_bot * tf_bot + (depth - tf_top - tf_bot) * tw
+        # Approximate Zx for doubly-symmetric or singly-symmetric I-beam
+        # Zx = bf_top*tf_top*(d-tf_top) + tw*(d-tf_top-tf_bot)^2/4 + bf_bot*tf_bot*(d-tf_bot)
+        # Simplified: Zx ≈ A*d/4 for typical I-shapes (conservative)
+        hw = depth - tf_top - tf_bot
+        # Plastic neutral axis estimate (assume symmetric enough)
+        Zx = (bf_top * tf_top * (depth - tf_top / 2.0)
+              + bf_bot * tf_bot * (tf_bot / 2.0)
+              + tw * hw * (depth / 2.0)) / 1.0
+        # More accurate: full plastic section modulus
+        # Top flange: bf_top * tf_top, centroid at d - tf_top/2
+        # Web: tw * hw, centroid at tf_bot + hw/2
+        # Bot flange: bf_bot * tf_bot, centroid at tf_bot/2
+        # PNA divides area in half
+        A_total = bf_top * tf_top + tw * hw + bf_bot * tf_bot
+        half_A = A_total / 2.0
+        # Find PNA from bottom
+        if bf_bot * tf_bot >= half_A:
+            pna = half_A / bf_bot  # PNA in bottom flange
+        elif bf_bot * tf_bot + tw * hw >= half_A:
+            pna = tf_bot + (half_A - bf_bot * tf_bot) / tw  # PNA in web
+        else:
+            pna = depth - (A_total - half_A) / bf_top  # PNA in top flange
+        # Zx = sum of (area_i * |y_centroid_i - pna|)
+        # Simplified: use first moment approximation
+        Zx_est = (bf_bot * tf_bot * abs(tf_bot / 2.0 - pna)
+                 + tw * hw * abs(tf_bot + hw / 2.0 - pna)
+                 + bf_top * tf_top * abs(depth - tf_top / 2.0 - pna))
+        if Zx_est > 0:
+            Zx = Zx_est
+
+    # Compute Ix if not provided (for Sx estimate)
+    if Ix == 0 and depth > 0 and tw > 0 and tf_top > 0:
+        hw = depth - tf_top - tf_bot
+        # Parallel axis theorem
+        ybar = depth / 2.0  # approximate centroid
+        Ix = (tw * hw ** 3 / 12.0
+              + bf_top * tf_top ** 3 / 12.0 + bf_top * tf_top * (depth - tf_top / 2.0 - ybar) ** 2
+              + bf_bot * tf_bot ** 3 / 12.0 + bf_bot * tf_bot * (tf_bot / 2.0 - ybar) ** 2)
+
+    if Sx == 0 and Ix > 0 and depth > 0:
+        Sx = 2.0 * Ix / depth
+
+    # Use HPS 70W for flanges if section type indicates it
+    sec_type = (section.get("type", "") or "").lower()
+    if "hps" in sec_type or "70w" in sec_type:
+        fy_ksi = 70.0
+
+    # --- Flexural capacity: φMn = 1.0 × Fy × Zx (AASHTO φ_f = 1.0) ---
     if Zx > 0:
-        cap["phi_Mn"] = 0.9 * fy_ksi * Zx  # kip-in
+        cap["phi_Mn"] = 1.0 * fy_ksi * Zx  # kip-in
     elif Sx > 0:
-        cap["phi_Mn"] = 0.9 * fy_ksi * Sx
-    elif Ix > 0 and depth > 0:
-        Sx_est = 2.0 * Ix / depth
-        cap["phi_Mn"] = 0.9 * fy_ksi * Sx_est
+        cap["phi_Mn"] = 1.0 * fy_ksi * Sx
     else:
         cap["phi_Mn"] = 0.0
 
-    # --- Shear capacity: φVn = 0.9 × 0.58 × Fy × Aw ---
-    tw = section.get("tw", 0.0)
+    # --- Shear capacity: φVn = 1.0 × 0.58 × Fy_web × Aw ---
     if tw > 0 and depth > 0:
-        Aw = depth * tw  # web area in²
-        cap["phi_Vn"] = 0.9 * 0.58 * fy_ksi * Aw  # kip
+        Aw = depth * tw
+        cap["phi_Vn"] = 1.0 * 0.58 * fy_ksi * Aw  # kip
     elif area > 0:
-        # Rough estimate: web area ≈ 35% of total area for I-shapes
         Aw_est = 0.35 * area
-        cap["phi_Vn"] = 0.9 * 0.58 * fy_ksi * Aw_est
+        cap["phi_Vn"] = 1.0 * 0.58 * fy_ksi * Aw_est
     else:
         cap["phi_Vn"] = 0.0
 
     # --- Axial capacity (steel): φPn = 0.9 × Fy × A ---
+    if area == 0 and depth > 0 and tw > 0 and tf_top > 0:
+        hw = depth - tf_top - tf_bot
+        area = bf_top * tf_top + bf_bot * tf_bot + hw * tw
     if area > 0:
-        cap["phi_Pn"] = 0.9 * fy_ksi * area  # kip (yield, not buckling)
+        cap["phi_Pn"] = 0.9 * fy_ksi * area
     else:
         cap["phi_Pn"] = 0.0
 
@@ -1323,30 +1381,76 @@ def build_element_results_from_analysis(
                     fy_ksi = fy_val
                     break
 
+        # Build a flat section lookup including nested params
+        all_sections: dict[int | str, dict] = {}
+        for s in sections_list:
+            stag = s.get("tag")
+            # Flatten: merge params/steel_section into top-level for capacity lookup
+            flat = dict(s)
+            if "params" in s and isinstance(s["params"], dict):
+                flat.update(s["params"])
+                if "steel_section" in s["params"]:
+                    flat.update(s["params"]["steel_section"])
+            all_sections[stag] = flat
+
+        # Also build from superstructure sections (often in separate path)
+        # These have the actual girder geometry
+        super_sections = []
+        # Check common locations for superstructure section data
+        for key in ("superstructure_sections", "sections"):
+            if key in model and isinstance(model[key], list):
+                super_sections.extend(model[key])
+
+        for s in super_sections:
+            stag = s.get("tag")
+            flat = dict(s)
+            if "params" in s and isinstance(s["params"], dict):
+                flat.update(s["params"])
+                if "steel_section" in s["params"]:
+                    flat.update(s["params"]["steel_section"])
+            # Don't overwrite existing entries
+            if stag not in all_sections:
+                all_sections[stag] = flat
+
         # Map elements to sections
         elements_list = model.get("elements", [])
         for elem in elements_list:
             etag = elem.get("tag", elem.get("element_tag"))
-            sec = elem.get("section", {})
-            if isinstance(sec, dict):
-                sections_by_elem[etag] = sec
-            elif isinstance(sec, (int, str)):
-                # Find section by tag
-                for s in sections_list:
-                    if s.get("tag") == sec:
-                        sections_by_elem[etag] = s
-                        break
+            sec_ref = elem.get("section", {})
+            if isinstance(sec_ref, dict):
+                # Flatten dict section
+                flat = dict(sec_ref)
+                if "params" in sec_ref and isinstance(sec_ref["params"], dict):
+                    flat.update(sec_ref["params"])
+                    if "steel_section" in sec_ref["params"]:
+                        flat.update(sec_ref["params"]["steel_section"])
+                sections_by_elem[etag] = flat
+            elif isinstance(sec_ref, (int, str)):
+                # Find section by tag in our flat lookup
+                if sec_ref in all_sections:
+                    sections_by_elem[etag] = all_sections[sec_ref]
+                else:
+                    # Try matching by original tag
+                    for stag, sdata in all_sections.items():
+                        if sdata.get("_original_tag") == sec_ref:
+                            sections_by_elem[etag] = sdata
+                            break
 
-            # Classify element type
+            # Classify element type based on tag ranges and type
             etype = (elem.get("type", "") or elem.get("element_type", "")).lower()
+            etag_num = int(etag) if isinstance(etag, (int, str)) and str(etag).isdigit() else 0
             if any(kw in etype for kw in ("girder", "beam", "super", "frame")):
                 element_types[etag] = "girder"
             elif any(kw in etype for kw in ("column", "pier", "sub")):
                 element_types[etag] = "column"
             elif any(kw in etype for kw in ("bearing", "spring")):
                 element_types[etag] = "bearing"
+            elif etype == "dispbeamcolumn" and 500 <= etag_num < 30000:
+                element_types[etag] = "girder"  # superstructure range
+            elif etype == "dispbeamcolumn" and etag_num >= 30000:
+                element_types[etag] = "column"  # substructure range
             else:
-                element_types[etag] = "girder"  # default assumption
+                element_types[etag] = "girder"
 
         # Get span lengths
         nodes_list = model.get("nodes", [])
@@ -1357,36 +1461,9 @@ def build_element_results_from_analysis(
         elif isinstance(span_data, list):
             spans_in = [s * 12.0 for s in span_data]
 
-    # --- If we have pre-computed DCRs, use them ---
-    if dcr_data:
-        for elem_tag_str, checks in dcr_data.items():
-            try:
-                elem_tag = int(elem_tag_str)
-            except (ValueError, TypeError):
-                elem_tag = elem_tag_str
-
-            for check_name, dcr_val in checks.items():
-                if dcr_val is None:
-                    continue
-                # Determine force type from check name
-                force_type = "unknown"
-                cn_lower = check_name.lower()
-                if "moment" in cn_lower or "flex" in cn_lower:
-                    force_type = "moment"
-                elif "shear" in cn_lower:
-                    force_type = "shear"
-                elif "axial" in cn_lower or "p_m" in cn_lower:
-                    force_type = "axial"
-                elif "deflect" in cn_lower or "disp" in cn_lower:
-                    force_type = "deflection"
-
-                element_results.append({
-                    "element": elem_tag,
-                    "location": f"Element {elem_tag}",
-                    "dcr": float(dcr_val),
-                    "force_type": force_type,
-                    "controlling_combo": check_name,
-                })
+    # NOTE: Pre-computed dcr_data from assembler divides by 1.0 (no real
+    # capacities) — skip it entirely and compute DCRs from raw envelopes
+    # with real section capacities instead.
 
     # --- Compute DCRs from envelopes (raw force data) ---
     if envelopes:
@@ -1405,21 +1482,31 @@ def build_element_results_from_analysis(
                 cap = _get_section_capacity(section, fy_ksi)
 
             # Extract max forces from envelope
-            # Envelope format: {force_type: {max: val, min: val, controlling_combo: str}}
-            M_max = abs(_safe_get(env, "moment", "max"))
-            M_min = abs(_safe_get(env, "moment", "min"))
-            M_demand = max(M_max, M_min)
-            M_combo = _safe_get(env, "moment", "controlling_combo", default="Strength I")
+            # OpenSees 3D beam format: N_i, Vy_i, Vz_i, T_i, My_i, Mz_i (and _j end)
+            # We need: max moment (Mz), max shear (Vy), max axial (N)
+            # Also handle generic keys: moment/shear/axial
+            def _env_max(env, *keys):
+                """Get max absolute value across multiple envelope keys."""
+                best = 0.0
+                combo = "Gravity"
+                for k in keys:
+                    sub = env.get(k, {})
+                    if isinstance(sub, dict):
+                        vmax = abs(sub.get("max", 0.0) or 0.0)
+                        vmin = abs(sub.get("min", 0.0) or 0.0)
+                        v = max(vmax, vmin)
+                        if v > best:
+                            best = v
+                            combo = sub.get("controlling_combo", "Gravity")
+                    elif isinstance(sub, (int, float)):
+                        v = abs(sub)
+                        if v > best:
+                            best = v
+                return best, combo
 
-            V_max = abs(_safe_get(env, "shear", "max"))
-            V_min = abs(_safe_get(env, "shear", "min"))
-            V_demand = max(V_max, V_min)
-            V_combo = _safe_get(env, "shear", "controlling_combo", default="Strength I")
-
-            P_max = abs(_safe_get(env, "axial", "max"))
-            P_min = abs(_safe_get(env, "axial", "min"))
-            P_demand = max(P_max, P_min)
-            P_combo = _safe_get(env, "axial", "controlling_combo", default="Strength I")
+            M_demand, M_combo = _env_max(env, "Mz_i", "Mz_j", "My_i", "My_j", "moment")
+            V_demand, V_combo = _env_max(env, "Vy_i", "Vy_j", "Vz_i", "Vz_j", "shear")
+            P_demand, P_combo = _env_max(env, "N_i", "N_j", "axial")
 
             location = f"Element {elem_tag}"
 
