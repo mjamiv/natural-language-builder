@@ -885,7 +885,7 @@ def _generate_materials_script(materials: list[dict], sections: list[dict]) -> s
                 n_bars = steel.get("n_bars", 16)
                 bar_area = steel.get("bar_area", 1.0)
                 r_steel = steel.get("radius", r_core - 0.5)
-                lines.append(f"ops.layer('circ', {mat_steel}, {n_bars}, {bar_area}, 0.0, 0.0, {r_steel:.2f})")
+                lines.append(f"ops.layer('circ', {mat_steel}, {n_bars}, {bar_area}, 0.0, 0.0, {r_steel:.2f}, 0.0, 6.283185307)")
             else:
                 lines.append(f"ops.section('Elastic', {tag}, 29000.0, 100.0, 5000.0, 29000.0, 100.0, 1.0e10)")
         else:
@@ -913,7 +913,7 @@ def _generate_materials_script(materials: list[dict], sections: list[dict]) -> s
             r_in = cover.get("inner_radius", r_core)
             lines.append(f"ops.patch('circ', {mat_cover}, {cover.get('nfr', 2)}, {cover.get('nft', 16)}, 0.0, 0.0, {r_in:.2f}, {r_out:.2f}, 0.0, 6.283185307)")
             mat_steel = steel.get("material", tag + 3)
-            lines.append(f"ops.layer('circ', {mat_steel}, {steel.get('n_bars', 16)}, {steel.get('bar_area', 1.0)}, 0.0, 0.0, {steel.get('radius', r_core - 0.5):.2f})")
+            lines.append(f"ops.layer('circ', {mat_steel}, {steel.get('n_bars', 16)}, {steel.get('bar_area', 1.0)}, 0.0, 0.0, {steel.get('radius', r_core - 0.5):.2f}, 0.0, 6.283185307)")
         else:
             lines.append(f"ops.section('Elastic', {tag}, 29000.0, 100.0, 5000.0, 29000.0, 100.0, 1.0e10)")
         lines.append("")
@@ -937,7 +937,7 @@ def _generate_materials_script(materials: list[dict], sections: list[dict]) -> s
             lines.append(f"ops.section('Fiber', {tag}, '-GJ', 1.0e10)")
             lines.append(f"ops.patch('circ', {mat_conf}, 8, 8, 0.0, 0.0, 0.0, {r_core:.2f}, 0.0, 6.283185307)")
             lines.append(f"ops.patch('circ', {mat_unconf}, 4, 8, 0.0, 0.0, {r_core:.2f}, {r_out:.2f}, 0.0, 6.283185307)")
-            lines.append(f"ops.layer('circ', {mat_steel}, {n_bars}, {bar_area}, 0.0, 0.0, {r_core:.2f})")
+            lines.append(f"ops.layer('circ', {mat_steel}, {n_bars}, {bar_area}, 0.0, 0.0, {r_core:.2f}, 0.0, 6.283185307)")
         elif stype == "rectangular_rc":
             w = s.get("width_in", 48.0)
             h = s.get("depth_in", 48.0)
@@ -983,7 +983,7 @@ def _generate_materials_script(materials: list[dict], sections: list[dict]) -> s
                 n_bars = steel.get("n_bars", 16)
                 bar_area = steel.get("bar_area", 1.0)
                 r_steel = steel.get("radius", r_core - 0.5)
-                lines.append(f"ops.layer('circ', {mat_steel}, {n_bars}, {bar_area}, 0.0, 0.0, {r_steel:.2f})")
+                lines.append(f"ops.layer('circ', {mat_steel}, {n_bars}, {bar_area}, 0.0, 0.0, {r_steel:.2f}, 0.0, 6.283185307)")
             else:
                 # Fallback elastic
                 lines.append(f"ops.section('Elastic', {tag}, 29000.0, 100.0, 5000.0, 29000.0, 100.0, 1.0e10)")
