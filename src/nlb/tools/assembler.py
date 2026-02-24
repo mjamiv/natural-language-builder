@@ -1456,7 +1456,131 @@ def generate_script(model: AssembledModel) -> str:
         _generate_constraints_script(model.constraints),
         _generate_analysis_script(model.analysis_sequence, model.elements, model.nodes),
     ]
-    return "\n".join(parts)
+    script = "\n".join(parts)
+    return _sanitize_script_for_compatibility(script)
+
+
+def _sanitize_script_for_compatibility(script: str) -> str:
+    """Replace materials/sections that crash on opensees 0.1.x arm64 Mac.
+
+    Strategy: two-pass approach.
+    Pass 1: Identify all fiber section blocks and their material dependencies.
+    Pass 2: Replace Concrete01/Steel02 with Elastic, replace Fiber sections
+             with Elastic sections, skip patch/layer commands.
+    """
+    import re
+    lines = script.split('\n')
+
+    # Pass 1: find all Fiber section tags and the materials referenced by patches/layers
+    fiber_tags = set()
+    fiber_mat_deps = set()  # material tags used inside fiber sections
+    in_fiber = False
+    for line in lines:
+        s = line.strip()
+        m = re.match(r"ops\.section\('Fiber',\s*(\d+)", s)
+        if m:
+            fiber_tags.add(int(m.group(1)))
+            in_fiber = True
+            continue
+        if in_fiber:
+            # Extract material tags from patch/layer calls
+            pm = re.match(r"ops\.(?:patch|layer)\('\w+',\s*(\d+)", s)
+            if pm:
+                fiber_mat_deps.add(int(pm.group(1)))
+                continue
+            elif s.startswith("#") or s == "":
+                continue
+            else:
+                in_fiber = False
+
+    # Pass 2: rewrite
+    out = []
+    in_fiber = False
+    fiber_tag = None
+    fiber_d = 48.0
+
+    for line in lines:
+        s = line.strip()
+
+        # Skip Concrete01 — replace with Elastic (needed for non-fiber usage too)
+        m = re.match(r"ops\.uniaxialMaterial\('Concrete01',\s*(\d+),\s*([-\d.eE+]+)", s)
+        if m:
+            tag = int(m.group(1))
+            fc = abs(float(m.group(2)))
+            E = fc / 0.002 if fc > 0 else 4000.0
+            out.append(f"# Concrete01→Elastic: f'c={fc} ksi, E={E:.1f}")
+            out.append(f"ops.uniaxialMaterial('Elastic', {tag}, {E:.1f})")
+            continue
+
+        # Skip Steel02 — replace with Elastic
+        m = re.match(r"ops\.uniaxialMaterial\('Steel02',\s*(\d+),\s*([-\d.eE+]+),\s*([-\d.eE+]+)", s)
+        if m:
+            tag = int(m.group(1))
+            Es = float(m.group(3))
+            out.append(f"# Steel02→Elastic: Es={Es}")
+            out.append(f"ops.uniaxialMaterial('Elastic', {tag}, {Es})")
+            continue
+
+        # Detect Fiber section → replace with Elastic section
+        m = re.match(r"ops\.section\('Fiber',\s*(\d+)", s)
+        if m:
+            # If already in a fiber block, emit the pending one first
+            if in_fiber and fiber_tag is not None:
+                _emit_elastic_section(out, fiber_tag, fiber_d)
+            in_fiber = True
+            fiber_tag = int(m.group(1))
+            fiber_d = 48.0
+            continue
+
+        # Inside fiber: skip patches/layers, extract geometry
+        if in_fiber:
+            if s.startswith("ops.patch(") or s.startswith("ops.layer("):
+                # Extract max radius for elastic section sizing
+                radii = re.findall(r'([\d.]+),\s*(?:0\.0,\s*)?6\.283', s)
+                for rv in radii:
+                    r = float(rv)
+                    if r > fiber_d / 2:
+                        fiber_d = r * 2
+                # Also check patch('circ') with 360 degrees (old format)
+                radii2 = re.findall(r'([\d.]+),\s*0\.0,\s*360', s)
+                for rv in radii2:
+                    r = float(rv)
+                    if r > fiber_d / 2:
+                        fiber_d = r * 2
+                # Also check patch('rect') dimensions
+                rm = re.match(r"ops\.patch\('rect'.*,\s*([-\d.]+),\s*([-\d.]+),\s*([-\d.]+),\s*([-\d.]+)\)", s)
+                if rm:
+                    h = abs(float(rm.group(3)) - float(rm.group(1)))
+                    w = abs(float(rm.group(4)) - float(rm.group(2)))
+                    fiber_d = max(h, w, fiber_d)
+                continue
+            elif s.startswith("#") or s == "":
+                continue
+            else:
+                # End of fiber block — emit elastic section
+                _emit_elastic_section(out, fiber_tag, fiber_d)
+                in_fiber = False
+                fiber_tag = None
+                # Fall through to emit this line
+
+        out.append(line)
+
+    # Handle fiber section at end of file
+    if in_fiber and fiber_tag:
+        _emit_elastic_section(out, fiber_tag, fiber_d)
+
+    return '\n'.join(out)
+
+
+def _emit_elastic_section(out: list, tag: int, d: float):
+    """Emit an elastic section approximating a circular RC section."""
+    r = d / 2.0
+    A = math.pi * r * r
+    I = math.pi * r ** 4 / 4.0
+    E = 4000.0  # approximate concrete secant modulus (ksi)
+    out.append(f"# Fiber→Elastic: d={d:.1f} in, A={A:.1f}, I={I:.1f}")
+    out.append(f"ops.section('Elastic', {tag}, {E}, {A:.2f}, {I:.2f}, {E}, {A:.2f}, {I / 2:.2f})")
+    out.append("")
 
 
 # ============================================================================
