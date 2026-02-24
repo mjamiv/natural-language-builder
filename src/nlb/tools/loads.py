@@ -230,6 +230,7 @@ class LoadModel:
     distribution_factors: dict = field(default_factory=dict)
     adversarial_cases: list[LoadCase] = field(default_factory=list)
     adversarial_combos: list[LoadCombination] = field(default_factory=list)
+    moving_load_positions: dict = field(default_factory=dict)
 
     @property
     def total_combinations(self) -> int:
@@ -242,6 +243,7 @@ class LoadModel:
             "distribution_factors": self.distribution_factors,
             "adversarial_cases": [c.to_dict() for c in self.adversarial_cases],
             "adversarial_combos": [c.to_dict() for c in self.adversarial_combos],
+            "moving_load_positions": self.moving_load_positions,
             "total_combinations": self.total_combinations,
         }
 
@@ -1752,6 +1754,735 @@ def _generate_adversarial_combos(
 
 
 # ======================================================================
+# Moving load positions for influence-line analysis
+# ======================================================================
+
+def generate_moving_load_positions(
+    span_lengths: list[float],
+    num_positions: int = 20,
+) -> dict:
+    """Generate moving load positions for HL-93 influence-line analysis.
+
+    For each position along the bridge, computes axle locations for
+    design truck, design tandem, and lane load.
+
+    Args:
+        span_lengths: List of span lengths in feet.
+        num_positions: Number of truck front-axle positions to evaluate.
+
+    Returns:
+        Dict with keys:
+            ``truck_positions``: list of truck position dicts
+            ``tandem_positions``: list of tandem position dicts
+            ``lane_load``: uniform lane load dict
+    """
+    total_length_ft = sum(span_lengths)
+
+    # Generate evenly-spaced front-axle positions along bridge
+    step = total_length_ft / (num_positions + 1)
+    positions_ft = [step * (i + 1) for i in range(num_positions)]
+
+    truck_positions = []
+    for pos in positions_ft:
+        # Design truck: 8k at front, 32k at 14ft, 32k at 28ft behind
+        axle_loads = []
+        for axle in DESIGN_TRUCK_AXLES:
+            loc_ft = pos - axle["position_ft"]  # axle position on bridge
+            if 0 <= loc_ft <= total_length_ft:
+                axle_loads.append({
+                    "location_ft": round(loc_ft, 2),
+                    "location_in": round(loc_ft * 12.0, 2),
+                    "force_kip": axle["weight_kip"],
+                    "force_kip_im": round(axle["weight_kip"] * (1 + IM_TRUCK), 2),
+                })
+        if len(axle_loads) >= 2:  # At least 2 axles on bridge
+            truck_positions.append({
+                "type": "truck",
+                "front_axle_ft": round(pos, 2),
+                "axle_loads": axle_loads,
+            })
+
+    tandem_positions = []
+    for pos in positions_ft:
+        # Design tandem: 25k at front, 25k at 4ft behind
+        axle_loads = []
+        for axle in DESIGN_TANDEM_AXLES:
+            loc_ft = pos - axle["position_ft"]
+            if 0 <= loc_ft <= total_length_ft:
+                axle_loads.append({
+                    "location_ft": round(loc_ft, 2),
+                    "location_in": round(loc_ft * 12.0, 2),
+                    "force_kip": axle["weight_kip"],
+                    "force_kip_im": round(axle["weight_kip"] * (1 + IM_TRUCK), 2),
+                })
+        if len(axle_loads) >= 1:
+            tandem_positions.append({
+                "type": "tandem",
+                "front_axle_ft": round(pos, 2),
+                "axle_loads": axle_loads,
+            })
+
+    lane_load = {
+        "type": "lane",
+        "w_klf": DESIGN_LANE_KLF,
+        "w_kip_per_in": round(DESIGN_LANE_KLF / 12.0, 6),
+        "total_length_ft": total_length_ft,
+        "total_force_kip": round(DESIGN_LANE_KLF * total_length_ft, 2),
+        "impact_factor": IM_LANE,
+    }
+
+    return {
+        "truck_positions": truck_positions,
+        "tandem_positions": tandem_positions,
+        "lane_load": lane_load,
+        "total_length_ft": total_length_ft,
+        "num_positions": num_positions,
+        "span_lengths_ft": span_lengths,
+    }
+
+
+# ======================================================================
+# OpenSees load combination script generation
+# ======================================================================
+
+def generate_load_combination_script(
+    load_cases: list[LoadCase],
+    combinations: list[LoadCombination],
+    element_tags: list[int] | None = None,
+    node_map: dict | None = None,
+    girder_spacing_ft: float = 8.0,
+) -> str:
+    """Generate OpenSees Python code for load combination analysis.
+
+    Produces a script block that:
+      1. Defines a timeSeries + pattern for each load case
+      2. For each combination, applies factored loads
+      3. Runs static analysis
+      4. Extracts element forces into a results dict
+      5. Computes envelopes across all combinations
+
+    Args:
+        load_cases:       List of :class:`LoadCase` objects.
+        combinations:     List of :class:`LoadCombination` objects.
+        element_tags:     Element tags to extract forces from.
+                          If None, uses ``ops.getEleTags()``.
+        node_map:         Dict mapping load application descriptions to node tags.
+                          If None, loads are applied to all beam elements.
+        girder_spacing_ft: Girder spacing for simplified distribution factors.
+
+    Returns:
+        Multi-line Python string ready to be inserted into an OpenSees script.
+    """
+    lines = [
+        "",
+        "# " + "=" * 60,
+        "# LOAD COMBINATION ANALYSIS",
+        "# " + "=" * 60,
+        "",
+        "import copy",
+        "",
+        "# --- Simplified distribution factors ---",
+        f"g_moment = {girder_spacing_ft} / 11.0  # S/11 for moment",
+        f"g_shear = {girder_spacing_ft} / 7.0   # S/7 for shear",
+        "",
+        "# --- Element tags for force extraction ---",
+    ]
+
+    if element_tags:
+        lines.append(f"envelope_ele_tags = {element_tags}")
+    else:
+        lines.append("envelope_ele_tags = ops.getEleTags()")
+
+    lines.extend([
+        "",
+        "# Storage for all combination results",
+        "combination_results = {}",
+        "",
+    ])
+
+    # Build a mapping from load case name to a pattern tag
+    ts_tag_start = 100
+    pat_tag_start = 100
+
+    # Categorize load cases for script generation
+    dc_cases = [c for c in load_cases if c.load_type == "DC"]
+    dw_cases = [c for c in load_cases if c.load_type == "DW"]
+    ll_cases = [c for c in load_cases if c.load_type == "LL"
+                and any(ld.get("type") == "distributed" for ld in c.loads)]
+    ll_point_cases = [c for c in load_cases if c.load_type == "LL"
+                      and any(ld.get("type") == "point" for ld in c.loads)]
+    ws_cases = [c for c in load_cases if c.load_type == "WS"]
+    eq_cases = [c for c in load_cases if c.load_type == "EQ"]
+    br_cases = [c for c in load_cases if c.load_type == "BR"]
+
+    # Generate individual load case application functions
+    lines.extend([
+        "def apply_load_case(case_name, factor, ts_tag, pat_tag):",
+        "    \"\"\"Apply a single load case with the given factor.\"\"\"",
+        "    ops.timeSeries('Linear', ts_tag)",
+        "    ops.pattern('Plain', pat_tag, ts_tag)",
+        "",
+    ])
+
+    # Build the case dispatch
+    case_idx = 0
+    case_tag_map = {}
+    for case in load_cases:
+        tag = ts_tag_start + case_idx
+        case_tag_map[case.name] = tag
+        case_idx += 1
+
+    # Generate the load application logic per case type
+    lines.extend([
+        "    # Load case dispatch by name",
+    ])
+
+    first = True
+    for case in load_cases:
+        prefix = "if" if first else "elif"
+        first = False
+
+        if case.load_type in ("DC", "DW"):
+            # Distributed gravity loads
+            for ld in case.loads:
+                if ld.get("type") == "distributed":
+                    w_kli = ld.get("w_kip_per_in", 0.0)
+                    lines.extend([
+                        f"    {prefix} case_name == '{case.name}':",
+                        f"        # {case.description[:80]}",
+                        f"        w = {w_kli} * factor",
+                        f"        for ele_tag in envelope_ele_tags:",
+                        f"            try:",
+                        f"                ops.eleLoad('-ele', ele_tag, '-type', '-beamUniform', -abs(w), 0.0)",
+                        f"            except Exception:",
+                        f"                pass  # Skip non-beam elements",
+                    ])
+                    break
+
+        elif case.load_type == "LL":
+            for ld in case.loads:
+                if ld.get("type") == "distributed":
+                    w_kli = ld.get("w_kip_per_in", 0.0)
+                    lines.extend([
+                        f"    {prefix} case_name == '{case.name}':",
+                        f"        # Lane load: {case.description[:60]}",
+                        f"        w = {w_kli} * factor * g_moment",
+                        f"        for ele_tag in envelope_ele_tags:",
+                        f"            try:",
+                        f"                ops.eleLoad('-ele', ele_tag, '-type', '-beamUniform', -abs(w), 0.0)",
+                        f"            except Exception:",
+                        f"                pass",
+                    ])
+                    break
+                elif ld.get("type") == "point":
+                    # Truck/tandem — apply as equivalent uniform for simplicity
+                    # (actual moving load handled separately in moving_load_analysis)
+                    m_kft = ld.get("max_moment_im_kft", 0.0)
+                    lines.extend([
+                        f"    {prefix} case_name == '{case.name}':",
+                        f"        # Vehicular: {case.description[:60]}",
+                        f"        # Applied as equivalent uniform for combination analysis",
+                        f"        pass  # Handled via envelope from moving load analysis",
+                    ])
+                    break
+                elif ld.get("type") in ("combination", "envelope"):
+                    lines.extend([
+                        f"    {prefix} case_name == '{case.name}':",
+                        f"        # HL-93 combination/envelope — skip (use components)",
+                        f"        pass",
+                    ])
+                    break
+
+        elif case.load_type == "WS":
+            for ld in case.loads:
+                if ld.get("type") == "distributed":
+                    w_kli = ld.get("w_kip_per_in", 0.0)
+                    lines.extend([
+                        f"    {prefix} case_name == '{case.name}':",
+                        f"        # Wind on structure: lateral",
+                        f"        w = {w_kli} * factor",
+                        f"        for ele_tag in envelope_ele_tags:",
+                        f"            try:",
+                        f"                ops.eleLoad('-ele', ele_tag, '-type', '-beamUniform', 0.0, -abs(w))",
+                        f"            except Exception:",
+                        f"                pass",
+                    ])
+                    break
+
+        elif case.load_type == "EQ":
+            lines.extend([
+                f"    {prefix} case_name == '{case.name}':",
+                f"        # Seismic: response spectrum — applied via modal combination",
+                f"        # Placeholder: apply as equivalent static = Csm * W",
+                f"        sds = {case.loads[0].get('sds', 0.267) if case.loads else 0.267}",
+                f"        for ele_tag in envelope_ele_tags:",
+                f"            try:",
+                f"                ops.eleLoad('-ele', ele_tag, '-type', '-beamUniform', 0.0, -0.10 * factor * sds)",
+                f"            except Exception:",
+                f"                pass",
+            ])
+
+        elif case.load_type == "BR":
+            lines.extend([
+                f"    {prefix} case_name == '{case.name}':",
+                f"        # Braking force — longitudinal point load",
+                f"        pass  # Applied at deck level node",
+            ])
+
+        else:
+            # Thermal, permit, scour, etc. — skip for now
+            lines.extend([
+                f"    {prefix} case_name == '{case.name}':",
+                f"        pass  # {case.load_type}: not directly applied in this script",
+            ])
+
+    lines.extend([
+        "",
+        "",
+    ])
+
+    # Generate combination analysis loop
+    lines.extend([
+        "# --- Run each load combination ---",
+        "combo_definitions = {",
+    ])
+
+    for combo in combinations:
+        # Only include factors for cases that exist
+        factor_str = ", ".join(
+            f"'{k}': {v}" for k, v in combo.factors.items()
+        )
+        lines.append(f"    '{combo.name}': {{{factor_str}}},")
+
+    lines.extend([
+        "}",
+        "",
+        "for combo_name, factors in combo_definitions.items():",
+        "    # Reset model to initial state",
+        "    ops.wipeAnalysis()",
+        "    ops.remove('loadPattern', -1)  # attempt cleanup",
+        "",
+        "    # Apply each load case with its factor",
+        "    ts_counter = 200",
+        "    pat_counter = 200",
+        "    for case_name, factor in factors.items():",
+        "        try:",
+        "            apply_load_case(case_name, factor, ts_counter, pat_counter)",
+        "            ts_counter += 1",
+        "            pat_counter += 1",
+        "        except Exception as e:",
+        "            print(f'WARNING: Could not apply {case_name} in {combo_name}: {e}')",
+        "",
+        "    # Run static analysis",
+        "    ops.system('UmfPack')",
+        "    ops.numberer('Plain')",
+        "    ops.constraints('Penalty', 1.0e12, 1.0e12)",
+        "    ops.integrator('LoadControl', 1.0)",
+        "    ops.test('NormUnbalance', 1.0e-2, 100)",
+        "    ops.algorithm('Linear')",
+        "    ops.analysis('Static')",
+        "    ok = ops.analyze(1)",
+        "",
+        "    if ok != 0:",
+        "        # Retry with Newton",
+        "        ops.algorithm('Newton')",
+        "        ok = ops.analyze(1)",
+        "",
+        "    # Extract element forces",
+        "    combo_forces = {}",
+        "    if ok == 0:",
+        "        for ele_tag in envelope_ele_tags:",
+        "            try:",
+        "                forces = ops.eleForce(ele_tag)",
+        "                # 2D beam: [N_i, V_i, M_i, N_j, V_j, M_j]",
+        "                # 3D beam: [N_i, Vy_i, Vz_i, T_i, My_i, Mz_i, N_j, ...]",
+        "                if len(forces) >= 6:",
+        "                    combo_forces[ele_tag] = {",
+        "                        'axial_i': forces[0],",
+        "                        'shear_i': forces[1],",
+        "                        'moment_i': forces[2],",
+        "                        'axial_j': forces[3] if len(forces) > 3 else -forces[0],",
+        "                        'shear_j': forces[4] if len(forces) > 4 else -forces[1],",
+        "                        'moment_j': forces[5] if len(forces) > 5 else -forces[2],",
+        "                    }",
+        "                    if len(forces) >= 12:",
+        "                        # 3D element: [Nx, Vy, Vz, T, My, Mz, ...]",
+        "                        combo_forces[ele_tag] = {",
+        "                            'axial_i': forces[0],",
+        "                            'shear_y_i': forces[1],",
+        "                            'shear_z_i': forces[2],",
+        "                            'torsion_i': forces[3],",
+        "                            'moment_y_i': forces[4],",
+        "                            'moment_z_i': forces[5],",
+        "                            'axial_j': forces[6],",
+        "                            'shear_y_j': forces[7],",
+        "                            'shear_z_j': forces[8],",
+        "                            'torsion_j': forces[9],",
+        "                            'moment_y_j': forces[10],",
+        "                            'moment_z_j': forces[11],",
+        "                        }",
+        "            except Exception:",
+        "                pass  # Element may not support eleForce",
+        "    else:",
+        "        print(f'WARNING: {combo_name} analysis did not converge')",
+        "",
+        "    combination_results[combo_name] = {",
+        "        'converged': ok == 0,",
+        "        'element_forces': combo_forces,",
+        "    }",
+        "",
+        "print(f'Completed {len(combination_results)} load combinations')",
+        "",
+    ])
+
+    # Generate envelope extraction inline
+    lines.extend([
+        "# --- Extract force envelopes ---",
+        "envelopes = {}",
+        "for ele_tag in envelope_ele_tags:",
+        "    env = {",
+        "        'max_moment': float('-inf'),",
+        "        'min_moment': float('inf'),",
+        "        'max_shear': float('-inf'),",
+        "        'min_shear': float('inf'),",
+        "        'max_axial': float('-inf'),",
+        "        'min_axial': float('inf'),",
+        "        'controlling_combo_moment': '',",
+        "        'controlling_combo_shear': '',",
+        "        'controlling_combo_axial': '',",
+        "    }",
+        "    for combo_name, result in combination_results.items():",
+        "        if not result['converged']:",
+        "            continue",
+        "        forces = result['element_forces'].get(ele_tag, {})",
+        "        if not forces:",
+        "            continue",
+        "",
+        "        # Get moment (use moment_i, moment_j, or moment_z variants)",
+        "        moments = []",
+        "        for key in ('moment_i', 'moment_j', 'moment_z_i', 'moment_z_j'):",
+        "            if key in forces:",
+        "                moments.append(abs(forces[key]))",
+        "        if moments:",
+        "            m = max(moments)",
+        "            if m > env['max_moment']:",
+        "                env['max_moment'] = m",
+        "                env['controlling_combo_moment'] = combo_name",
+        "            m_min = -m",
+        "            if m_min < env['min_moment']:",
+        "                env['min_moment'] = m_min",
+        "",
+        "        # Get shear",
+        "        shears = []",
+        "        for key in ('shear_i', 'shear_j', 'shear_y_i', 'shear_y_j'):",
+        "            if key in forces:",
+        "                shears.append(abs(forces[key]))",
+        "        if shears:",
+        "            v = max(shears)",
+        "            if v > env['max_shear']:",
+        "                env['max_shear'] = v",
+        "                env['controlling_combo_shear'] = combo_name",
+        "            if -v < env['min_shear']:",
+        "                env['min_shear'] = -v",
+        "",
+        "        # Get axial",
+        "        axials = []",
+        "        for key in ('axial_i', 'axial_j'):",
+        "            if key in forces:",
+        "                axials.append(forces[key])",
+        "        if axials:",
+        "            a_max = max(axials)",
+        "            a_min = min(axials)",
+        "            if a_max > env['max_axial']:",
+        "                env['max_axial'] = a_max",
+        "                env['controlling_combo_axial'] = combo_name",
+        "            if a_min < env['min_axial']:",
+        "                env['min_axial'] = a_min",
+        "",
+        "    # Clean up infinity values",
+        "    for key in ('max_moment', 'max_shear', 'max_axial'):",
+        "        if env[key] == float('-inf'):",
+        "            env[key] = 0.0",
+        "    for key in ('min_moment', 'min_shear', 'min_axial'):",
+        "        if env[key] == float('inf'):",
+        "            env[key] = 0.0",
+        "",
+        "    envelopes[ele_tag] = env",
+        "",
+        "print(f'Extracted envelopes for {len(envelopes)} elements')",
+        "",
+        "# Store in results",
+        "results['combination_results'] = {",
+        "    k: {'converged': v['converged'], 'num_elements': len(v['element_forces'])}",
+        "    for k, v in combination_results.items()",
+        "}",
+        "results['envelopes'] = envelopes",
+        "",
+    ])
+
+    return "\n".join(lines)
+
+
+# ======================================================================
+# Force envelope extraction (standalone, for post-processing)
+# ======================================================================
+
+def extract_force_envelopes(
+    element_tags: list[int],
+    combination_results: dict,
+) -> dict:
+    """Extract controlling force envelopes from load combination results.
+
+    For each element, finds the maximum and minimum forces across all
+    load combinations.
+
+    Args:
+        element_tags:        List of element tags to process.
+        combination_results: Dict from combination analysis, keyed by
+                             combo name, each with ``element_forces`` sub-dict.
+
+    Returns:
+        Dict keyed by element tag::
+
+            {element_tag: {
+                'max_moment': float,
+                'min_moment': float,
+                'max_shear': float,
+                'min_shear': float,
+                'max_axial': float,
+                'min_axial': float,
+                'controlling_combo_moment': str,
+                'controlling_combo_shear': str,
+                'controlling_combo_axial': str,
+            }}
+    """
+    envelopes = {}
+
+    for ele_tag in element_tags:
+        env = {
+            "max_moment": 0.0,
+            "min_moment": 0.0,
+            "max_shear": 0.0,
+            "min_shear": 0.0,
+            "max_axial": 0.0,
+            "min_axial": 0.0,
+            "controlling_combo_moment": "",
+            "controlling_combo_shear": "",
+            "controlling_combo_axial": "",
+        }
+
+        for combo_name, result in combination_results.items():
+            if not result.get("converged", False):
+                continue
+
+            forces = result.get("element_forces", {}).get(ele_tag, {})
+            if not forces:
+                continue
+
+            # Moments — check both ends
+            for key in ("moment_i", "moment_j", "moment_z_i", "moment_z_j"):
+                val = forces.get(key)
+                if val is not None:
+                    if val > env["max_moment"]:
+                        env["max_moment"] = val
+                        env["controlling_combo_moment"] = combo_name
+                    if val < env["min_moment"]:
+                        env["min_moment"] = val
+
+            # Shear
+            for key in ("shear_i", "shear_j", "shear_y_i", "shear_y_j"):
+                val = forces.get(key)
+                if val is not None:
+                    if val > env["max_shear"]:
+                        env["max_shear"] = val
+                        env["controlling_combo_shear"] = combo_name
+                    if val < env["min_shear"]:
+                        env["min_shear"] = val
+
+            # Axial
+            for key in ("axial_i", "axial_j"):
+                val = forces.get(key)
+                if val is not None:
+                    if val > env["max_axial"]:
+                        env["max_axial"] = val
+                        env["controlling_combo_axial"] = combo_name
+                    if val < env["min_axial"]:
+                        env["min_axial"] = val
+
+        envelopes[ele_tag] = env
+
+    return envelopes
+
+
+# ======================================================================
+# Moving load analysis script generation
+# ======================================================================
+
+def generate_moving_load_script(
+    span_lengths: list[float],
+    num_positions: int = 20,
+    girder_spacing_ft: float = 8.0,
+) -> str:
+    """Generate OpenSees Python code for HL-93 moving load analysis.
+
+    Traverses the bridge with design truck and tandem at discrete positions,
+    concurrent with lane load, to find the worst-case live load effects.
+
+    Args:
+        span_lengths:     List of span lengths (ft).
+        num_positions:    Number of positions to evaluate.
+        girder_spacing_ft: For distribution factor computation.
+
+    Returns:
+        Multi-line Python string for insertion into OpenSees script.
+    """
+    total_length_ft = sum(span_lengths)
+    total_length_in = total_length_ft * 12.0
+    step_in = total_length_in / (num_positions + 1)
+
+    # Build axle data for inline use
+    truck_axles_in = [
+        (a["weight_kip"] * (1 + IM_TRUCK), a["position_ft"] * 12.0)
+        for a in DESIGN_TRUCK_AXLES
+    ]
+    tandem_axles_in = [
+        (a["weight_kip"] * (1 + IM_TRUCK), a["position_ft"] * 12.0)
+        for a in DESIGN_TANDEM_AXLES
+    ]
+    lane_w_kli = DESIGN_LANE_KLF / 12.0
+
+    lines = [
+        "",
+        "# " + "=" * 60,
+        "# MOVING LOAD ANALYSIS (HL-93)",
+        "# " + "=" * 60,
+        "",
+        f"total_length_in = {total_length_in:.2f}",
+        f"num_ll_positions = {num_positions}",
+        f"ll_step_in = {step_in:.4f}",
+        f"g_moment_ll = {girder_spacing_ft} / 11.0",
+        f"g_shear_ll = {girder_spacing_ft} / 7.0",
+        "",
+        "# Axle data: (force_kip_with_IM, spacing_from_front_in)",
+        f"truck_axles = {truck_axles_in}",
+        f"tandem_axles = {tandem_axles_in}",
+        f"lane_w_kli = {lane_w_kli:.6f}",
+        "",
+        "# Find nodes along the superstructure for load application",
+        "# (Assumes nodes are sorted by X coordinate along bridge)",
+        "all_node_tags = ops.getNodeTags()",
+        "node_coords = {}",
+        "for nt in all_node_tags:",
+        "    coords = ops.nodeCoord(nt)",
+        "    node_coords[nt] = coords",
+        "",
+        "# Sort superstructure nodes by X for load application",
+        "sorted_nodes = sorted(node_coords.items(), key=lambda x: x[1][0])",
+        "",
+        "moving_load_results = {}",
+        "",
+        "def find_nearest_node(x_target):",
+        "    \"\"\"Find the node closest to x_target.\"\"\"",
+        "    best = None",
+        "    best_dist = float('inf')",
+        "    for nt, coords in sorted_nodes:",
+        "        dist = abs(coords[0] - x_target)",
+        "        if dist < best_dist:",
+        "            best_dist = dist",
+        "            best = nt",
+        "    return best",
+        "",
+        "for vehicle_type, axles in [('truck', truck_axles), ('tandem', tandem_axles)]:",
+        "    for pos_idx in range(num_ll_positions):",
+        "        front_x = ll_step_in * (pos_idx + 1)",
+        "",
+        "        # Reset for this position",
+        "        ops.wipeAnalysis()",
+        "",
+        "        ts_tag = 500 + pos_idx",
+        "        pat_tag = 500 + pos_idx",
+        "        ops.timeSeries('Linear', ts_tag)",
+        "        ops.pattern('Plain', pat_tag, ts_tag)",
+        "",
+        "        # Apply axle loads at nearest nodes",
+        "        for force_kip, spacing_in in axles:",
+        "            x_axle = front_x - spacing_in",
+        "            if 0 <= x_axle <= total_length_in:",
+        "                nn = find_nearest_node(x_axle)",
+        "                if nn is not None:",
+        "                    ops.load(nn, 0.0, -force_kip * g_moment_ll, 0.0)",
+        "",
+        "        # Apply concurrent lane load",
+        "        for ele_tag in envelope_ele_tags:",
+        "            try:",
+        "                ops.eleLoad('-ele', ele_tag, '-type', '-beamUniform',",
+        "                           -lane_w_kli * g_moment_ll, 0.0)",
+        "            except Exception:",
+        "                pass",
+        "",
+        "        # Analyze",
+        "        ops.system('UmfPack')",
+        "        ops.numberer('Plain')",
+        "        ops.constraints('Penalty', 1.0e12, 1.0e12)",
+        "        ops.integrator('LoadControl', 1.0)",
+        "        ops.test('NormUnbalance', 1.0e-2, 100)",
+        "        ops.algorithm('Linear')",
+        "        ops.analysis('Static')",
+        "        ok = ops.analyze(1)",
+        "",
+        "        if ok == 0:",
+        "            pos_key = f'{vehicle_type}_{pos_idx}'",
+        "            pos_forces = {}",
+        "            for ele_tag in envelope_ele_tags:",
+        "                try:",
+        "                    forces = ops.eleForce(ele_tag)",
+        "                    pos_forces[ele_tag] = forces",
+        "                except Exception:",
+        "                    pass",
+        "            moving_load_results[pos_key] = {",
+        "                'vehicle': vehicle_type,",
+        "                'front_axle_in': front_x,",
+        "                'element_forces': pos_forces,",
+        "                'converged': True,",
+        "            }",
+        "",
+        "# Find LL envelope from moving load analysis",
+        "ll_envelope = {}",
+        "for ele_tag in envelope_ele_tags:",
+        "    max_m = 0.0",
+        "    max_v = 0.0",
+        "    ctrl_m = ''",
+        "    ctrl_v = ''",
+        "    for pos_key, result in moving_load_results.items():",
+        "        forces = result['element_forces'].get(ele_tag, [])",
+        "        if len(forces) >= 6:",
+        "            m = max(abs(forces[2]), abs(forces[5]))",
+        "            v = max(abs(forces[1]), abs(forces[4]))",
+        "            if m > max_m:",
+        "                max_m = m",
+        "                ctrl_m = pos_key",
+        "            if v > max_v:",
+        "                max_v = v",
+        "                ctrl_v = pos_key",
+        "    ll_envelope[ele_tag] = {",
+        "        'max_moment': max_m,",
+        "        'max_shear': max_v,",
+        "        'controlling_position_moment': ctrl_m,",
+        "        'controlling_position_shear': ctrl_v,",
+        "    }",
+        "",
+        "results['moving_load_results'] = {",
+        "    'num_positions': len(moving_load_results),",
+        "    'll_envelope': ll_envelope,",
+        "}",
+        "print(f'Moving load analysis: {len(moving_load_results)} positions evaluated')",
+        "",
+    ]
+
+    return "\n".join(lines)
+
+
+# ======================================================================
 # Main entry point
 # ======================================================================
 
@@ -1842,6 +2573,11 @@ def generate_loads(
     standard_combos = _generate_combinations(all_cases)
 
     # ------------------------------------------------------------------
+    # Moving load positions for HL-93 influence-line analysis
+    # ------------------------------------------------------------------
+    moving_load_positions = generate_moving_load_positions(geom.spans_ft)
+
+    # ------------------------------------------------------------------
     # Adversarial loads
     # ------------------------------------------------------------------
     adversarial_cases = _generate_adversarial_cases(geom)
@@ -1856,6 +2592,7 @@ def generate_loads(
         distribution_factors=df,
         adversarial_cases=adversarial_cases,
         adversarial_combos=adversarial_combos,
+        moving_load_positions=moving_load_positions,
     )
 
     logger.info(
