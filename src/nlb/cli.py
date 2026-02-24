@@ -363,6 +363,24 @@ def run_pipeline(params: dict, output_dir: Path | None = None, verbose: bool = F
         model_dict = {"node_count": 0, "element_count": 0}
         results["model"] = model_dict
     
+    # ── Dump script if requested ────────────────────────────────────
+    if getattr(args, 'dump_script', False):
+        try:
+            from nlb.tools.assembler import generate_script, AssembledModel
+            if isinstance(model, AssembledModel):
+                script = generate_script(model)
+                out_path = Path(output_dir) / "opensees_script.py"
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_text(script)
+                success(f"OpenSees script written to {out_path} ({len(script):,} chars)")
+            else:
+                warn("Model not assembled — cannot generate script")
+        except Exception as e:
+            warn(f"Script dump failed: {e}")
+            if verbose:
+                import traceback; traceback.print_exc()
+        return results
+
     # ── Step 4: Run Analysis ─────────────────────────────────────────
     status("⚡", "Running analysis...")
     
@@ -684,6 +702,7 @@ Examples:
     parser.add_argument("--verbose", "-v", action="store_true", help="Show detailed output and tracebacks")
     parser.add_argument("--json", action="store_true", help="Output raw JSON instead of pretty print")
     parser.add_argument("--parse-only", action="store_true", help="Only parse the description, don't run analysis")
+    parser.add_argument("--dump-script", action="store_true", help="Dump generated OpenSees script to output dir (no analysis)")
     parser.add_argument("--site-recon", nargs=2, metavar=("LAT", "LON"), type=float, help="Run site recon only")
     
     args = parser.parse_args()
