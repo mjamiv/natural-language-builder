@@ -102,6 +102,7 @@ class AssembledModel:
     connections: list[dict] = field(default_factory=list)
     bounding_cases: dict = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    num_girders: int = 1
 
 
 @dataclass
@@ -1254,7 +1255,8 @@ def _generate_constraints_script(constraints: list[dict]) -> str:
 
 def _generate_analysis_script(analysis_sequence: list[str],
                               elements: list[dict] | None = None,
-                              nodes: list[dict] | None = None) -> str:
+                              nodes: list[dict] | None = None,
+                              num_girders: int = 1) -> str:
     """Generate analysis commands."""
     lines = [
         "# ============================================================",
@@ -1406,12 +1408,25 @@ def _generate_analysis_script(analysis_sequence: list[str],
                 "# --- Moving Load Analysis (HL-93) ---",
                 "# AASHTO 3.6.1.2: Truck + Lane, Tandem + Lane envelopes",
                 "# IM = 33% on truck/tandem only",
+                f"# Model has {num_girders} girder lines collapsed at Y=0.",
+                f"# Loads applied to ONE line only (first 1/{num_girders} of elements by Z-coord).",
                 "",
                 "if gravity_ok:",
                 "    import math as _ml_math",
                 "",
+                f"    _ml_num_girders = {num_girders}",
                 f"    _ml_sup_nodes = {sup_node_list!r}",
                 f"    _ml_sup_eles = {sup_ele_tags!r}",
+                "",
+                "    # Sort superstructure nodes by X coordinate",
+                "    _ml_node_x = []",
+                "    for _nt in _ml_sup_nodes:",
+                "        try:",
+                "            _c = ops.nodeCoord(_nt)",
+                "            _ml_node_x.append((_nt, _c[0]))",
+                "        except Exception:",
+                "            pass",
+                "    _ml_node_x.sort(key=lambda p: p[1])",
                 "",
                 "    # Sort superstructure nodes by X coordinate",
                 "    _ml_node_x = []",
@@ -1429,6 +1444,11 @@ def _generate_analysis_script(analysis_sequence: list[str],
                 "        _ml_bridge_len = _ml_x_max - _ml_x_min",
                 "    else:",
                 "        _ml_bridge_len = 0.0",
+                "",
+                "    # Scale factor: model has N girder lines at same location.",
+                "    # Divide applied LL by N so each element gets single-girder share.",
+                "    # Distribution factors are applied later.",
+                "    _ml_scale = 1.0 / _ml_num_girders",
                 "",
                 "    # HL-93 vehicle definitions (forces in kip, positions in inches)",
                 "    _IM = 0.33",
@@ -1455,6 +1475,15 @@ def _generate_analysis_script(analysis_sequence: list[str],
                 "                best_d = d",
                 "                best_nt = nt",
                 "        return best_nt",
+                "",
+                "    # Record gravity-only baseline forces (to isolate LL increments)",
+                "    _grav_baseline = {}",
+                "    for _et in _ml_sup_eles:",
+                "        try:",
+                "            _gf = ops.eleForce(_et)",
+                "            _grav_baseline[_et] = list(_gf) if _gf else [0]*12",
+                "        except Exception:",
+                "            _grav_baseline[_et] = [0]*12",
                 "",
                 "    # Initialize envelope storage: per element, 12 DOF (i+j ends)",
                 "    _ml_env_max = {}",
@@ -1497,17 +1526,19 @@ def _generate_analysis_script(analysis_sequence: list[str],
                 "                _x_axle = _front_x - _spacing_in",
                 "                if _ml_x_min <= _x_axle <= _ml_x_max:",
                 "                    _nn = _ml_nearest_node(_x_axle)",
+                "                    _f_scaled = _force_kip * _ml_scale",
                 "                    if _nn not in _loaded_nodes:",
-                "                        ops.load(_nn, 0.0, -_force_kip, 0.0, 0.0, 0.0, 0.0)",
+                "                        ops.load(_nn, 0.0, -_f_scaled, 0.0, 0.0, 0.0, 0.0)",
                 "                        _loaded_nodes.add(_nn)",
                 "                    else:",
                 "                        # Multiple axles on same node — add force",
-                "                        ops.load(_nn, 0.0, -_force_kip, 0.0, 0.0, 0.0, 0.0)",
+                "                        ops.load(_nn, 0.0, -_f_scaled, 0.0, 0.0, 0.0, 0.0)",
                 "",
-                "            # Apply lane load on all superstructure elements",
+                "            # Apply lane load (scaled by 1/num_girders)",
+                "            _lane_w_scaled = _lane_w * _ml_scale",
                 "            for _et in _ml_sup_eles:",
                 "                try:",
-                "                    ops.eleLoad('-ele', _et, '-type', '-beamUniform', -_lane_w, 0.0)",
+                "                    ops.eleLoad('-ele', _et, '-type', '-beamUniform', -_lane_w_scaled, 0.0)",
                 "                except Exception:",
                 "                    pass",
                 "",
@@ -1527,7 +1558,9 @@ def _generate_analysis_script(analysis_sequence: list[str],
                 "                    try:",
                 "                        _f = ops.eleForce(_et)",
                 "                        if _f and len(_f) >= 6:",
-                "                            _fl = list(_f)",
+                "                            # Subtract gravity baseline to get LL-only",
+                "                            _gb = _grav_baseline.get(_et, [0]*12)",
+                "                            _fl = [_f[i] - _gb[i] if i < len(_gb) else _f[i] for i in range(len(_f))]",
                 "                            if _ml_env_max[_et] is None:",
                 "                                _ml_env_max[_et] = list(_fl)",
                 "                                _ml_env_min[_et] = list(_fl)",
@@ -1635,7 +1668,7 @@ def generate_script(model: AssembledModel) -> str:
         _generate_nodes_script(model.nodes, model.boundary_conditions, model.elements, model.constraints),
         _generate_elements_script(model.elements, model.nodes),
         _generate_constraints_script(model.constraints),
-        _generate_analysis_script(model.analysis_sequence, model.elements, model.nodes),
+        _generate_analysis_script(model.analysis_sequence, model.elements, model.nodes, model.num_girders),
     ]
     script = "\n".join(parts)
     return _sanitize_script_for_compatibility(script)
@@ -2040,6 +2073,7 @@ def assemble_model(
     model.analysis_sequence = analysis_seq
     model.bounding_cases = bounding
     model.warnings = warnings
+    model.num_girders = num_girders
 
     model.node_count = len(all_nodes)
     model.element_count = len(all_elements)
