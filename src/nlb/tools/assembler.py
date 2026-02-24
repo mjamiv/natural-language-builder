@@ -713,9 +713,12 @@ def _generate_model_setup() -> str:
         
         try:
             import openseespy.opensees as ops
-        except ImportError:
-            print("ERROR: openseespy not installed. pip install openseespy")
-            sys.exit(1)
+        except (ImportError, RuntimeError):
+            try:
+                import opensees.openseespy as ops
+            except ImportError:
+                print("ERROR: openseespy not installed. pip install opensees")
+                sys.exit(1)
         
         # ============================================================
         # MODEL SETUP
@@ -1738,9 +1741,12 @@ def run_analysis(model: AssembledModel) -> AnalysisResults:
     """
     try:
         import openseespy.opensees as ops
-    except ImportError:
-        logger.warning("openseespy not installed — returning empty results")
-        return _extract_empty_results()
+    except (ImportError, RuntimeError):
+        try:
+            import opensees.openseespy as ops
+        except ImportError:
+            logger.warning("openseespy not installed — returning empty results")
+            return _extract_empty_results()
 
     results = AnalysisResults()
 
