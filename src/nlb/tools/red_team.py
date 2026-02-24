@@ -1173,11 +1173,479 @@ def generate_summary(
 
 
 # ===================================================================
+# DCR BUILDER — Extract real forces and compute DCRs from analysis
+# ===================================================================
+
+def _safe_get(d: dict, *keys, default=0.0):
+    """Safely traverse nested dicts."""
+    val = d
+    for k in keys:
+        if isinstance(val, dict):
+            val = val.get(k, default)
+        else:
+            return default
+    return val if val is not None else default
+
+
+def _get_section_capacity(section: dict, fy_ksi: float = 50.0) -> dict:
+    """Extract or estimate capacity values from a section dict.
+
+    Returns dict with phi_Mn, phi_Vn, phi_Pn (all in kip-inch units).
+    """
+    cap: dict = {}
+
+    # --- Flexural capacity: φMn = 0.9 × Fy × Zx ---
+    Zx = section.get("Zx", 0.0) or section.get("zx", 0.0)
+    Sx = section.get("Sx", 0.0) or section.get("sx", 0.0)
+    Ix = section.get("Ix", 0.0) or section.get("ix", 0.0)
+    depth = section.get("d", 0.0) or section.get("depth", 0.0)
+    area = section.get("A", 0.0) or section.get("area", 0.0)
+
+    if Zx > 0:
+        cap["phi_Mn"] = 0.9 * fy_ksi * Zx  # kip-in
+    elif Sx > 0:
+        cap["phi_Mn"] = 0.9 * fy_ksi * Sx
+    elif Ix > 0 and depth > 0:
+        Sx_est = 2.0 * Ix / depth
+        cap["phi_Mn"] = 0.9 * fy_ksi * Sx_est
+    else:
+        cap["phi_Mn"] = 0.0
+
+    # --- Shear capacity: φVn = 0.9 × 0.58 × Fy × Aw ---
+    tw = section.get("tw", 0.0)
+    if tw > 0 and depth > 0:
+        Aw = depth * tw  # web area in²
+        cap["phi_Vn"] = 0.9 * 0.58 * fy_ksi * Aw  # kip
+    elif area > 0:
+        # Rough estimate: web area ≈ 35% of total area for I-shapes
+        Aw_est = 0.35 * area
+        cap["phi_Vn"] = 0.9 * 0.58 * fy_ksi * Aw_est
+    else:
+        cap["phi_Vn"] = 0.0
+
+    # --- Axial capacity (steel): φPn = 0.9 × Fy × A ---
+    if area > 0:
+        cap["phi_Pn"] = 0.9 * fy_ksi * area  # kip (yield, not buckling)
+    else:
+        cap["phi_Pn"] = 0.0
+
+    cap["Zx"] = Zx
+    cap["Sx"] = Sx
+    cap["area"] = area
+    cap["depth"] = depth
+
+    return cap
+
+
+def _get_rc_column_capacity(section: dict, fc_ksi: float = 4.0, fy_ksi: float = 60.0) -> dict:
+    """Compute RC column capacity from section properties.
+
+    Returns dict with phi_Pn, phi_Mn (kip, kip-in).
+    """
+    cap: dict = {}
+    diameter = section.get("diameter", 0.0) or section.get("D", 0.0)
+    Ag = section.get("Ag", 0.0) or section.get("area", 0.0)
+    As = section.get("As", 0.0) or section.get("rebar_area", 0.0)
+
+    if diameter > 0 and Ag <= 0:
+        Ag = math.pi * (diameter / 2.0) ** 2
+
+    if As <= 0 and Ag > 0:
+        # Assume 1% reinforcement ratio
+        As = 0.01 * Ag
+
+    # φPn = 0.75 × (0.85×f'c×(Ag−As) + fy×As)  — AASHTO tied column
+    if Ag > 0:
+        cap["phi_Pn"] = 0.75 * (0.85 * fc_ksi * (Ag - As) + fy_ksi * As)
+    else:
+        cap["phi_Pn"] = 0.0
+
+    # Approximate φMn for circular column: ~0.12 × Ag × D × fy (rule of thumb)
+    if Ag > 0 and diameter > 0:
+        cap["phi_Mn"] = 0.9 * 0.12 * As * fy_ksi * diameter
+    else:
+        cap["phi_Mn"] = 0.0
+
+    cap["Ag"] = Ag
+    cap["As"] = As
+
+    return cap
+
+
+def build_element_results_from_analysis(
+    analysis_results: dict,
+    model: dict | None = None,
+) -> list[dict]:
+    """Build element_results list from raw AnalysisResults data and model sections.
+
+    This is the key function that bridges raw OpenSees output to the red team
+    DCR scanner. It:
+    1. Extracts element forces (axial, shear, moment) from analysis envelopes
+    2. Looks up section capacities from the model
+    3. Computes DCRs for flexure, shear, axial, P-M interaction, deflection
+
+    Args:
+        analysis_results: Dict form of AnalysisResults with keys:
+            envelopes, dcr, reactions, displacements, modal, controlling_cases
+        model: Dict form of AssembledModel with keys:
+            elements, sections, nodes, etc.
+
+    Returns:
+        List of element result dicts suitable for dcr_scanner().
+    """
+    element_results: list[dict] = []
+
+    if not analysis_results:
+        return element_results
+
+    envelopes = analysis_results.get("envelopes", {})
+    dcr_data = analysis_results.get("dcr", {})
+    displacements = analysis_results.get("displacements", {})
+    modal = analysis_results.get("modal", {})
+    controlling = analysis_results.get("controlling_cases", [])
+
+    # Build section lookup from model
+    sections_by_elem: dict[int | str, dict] = {}
+    element_types: dict[int | str, str] = {}  # elem_tag -> "girder"/"column"/etc
+    spans_in: list[float] = []  # span lengths in inches
+    fy_ksi = 50.0  # default steel yield
+
+    if model:
+        # Build section map
+        sections_list = model.get("sections", [])
+        materials_list = model.get("materials", [])
+
+        # Extract Fy from materials if available
+        for mat in materials_list:
+            if mat.get("type") in ("Steel01", "Steel02", "ElasticSteel"):
+                fy_val = mat.get("Fy", 0.0) or mat.get("fy", 0.0)
+                if fy_val > 0:
+                    fy_ksi = fy_val
+                    break
+
+        # Map elements to sections
+        elements_list = model.get("elements", [])
+        for elem in elements_list:
+            etag = elem.get("tag", elem.get("element_tag"))
+            sec = elem.get("section", {})
+            if isinstance(sec, dict):
+                sections_by_elem[etag] = sec
+            elif isinstance(sec, (int, str)):
+                # Find section by tag
+                for s in sections_list:
+                    if s.get("tag") == sec:
+                        sections_by_elem[etag] = s
+                        break
+
+            # Classify element type
+            etype = (elem.get("type", "") or elem.get("element_type", "")).lower()
+            if any(kw in etype for kw in ("girder", "beam", "super", "frame")):
+                element_types[etag] = "girder"
+            elif any(kw in etype for kw in ("column", "pier", "sub")):
+                element_types[etag] = "column"
+            elif any(kw in etype for kw in ("bearing", "spring")):
+                element_types[etag] = "bearing"
+            else:
+                element_types[etag] = "girder"  # default assumption
+
+        # Get span lengths
+        nodes_list = model.get("nodes", [])
+        # Try to extract span info from model metadata
+        span_data = model.get("span_ft", model.get("spans_ft", []))
+        if isinstance(span_data, (int, float)):
+            spans_in = [span_data * 12.0]
+        elif isinstance(span_data, list):
+            spans_in = [s * 12.0 for s in span_data]
+
+    # --- If we have pre-computed DCRs, use them ---
+    if dcr_data:
+        for elem_tag_str, checks in dcr_data.items():
+            try:
+                elem_tag = int(elem_tag_str)
+            except (ValueError, TypeError):
+                elem_tag = elem_tag_str
+
+            for check_name, dcr_val in checks.items():
+                if dcr_val is None:
+                    continue
+                # Determine force type from check name
+                force_type = "unknown"
+                cn_lower = check_name.lower()
+                if "moment" in cn_lower or "flex" in cn_lower:
+                    force_type = "moment"
+                elif "shear" in cn_lower:
+                    force_type = "shear"
+                elif "axial" in cn_lower or "p_m" in cn_lower:
+                    force_type = "axial"
+                elif "deflect" in cn_lower or "disp" in cn_lower:
+                    force_type = "deflection"
+
+                element_results.append({
+                    "element": elem_tag,
+                    "location": f"Element {elem_tag}",
+                    "dcr": float(dcr_val),
+                    "force_type": force_type,
+                    "controlling_combo": check_name,
+                })
+
+    # --- Compute DCRs from envelopes (raw force data) ---
+    if envelopes:
+        for elem_tag_str, env in envelopes.items():
+            try:
+                elem_tag = int(elem_tag_str)
+            except (ValueError, TypeError):
+                elem_tag = elem_tag_str
+
+            section = sections_by_elem.get(elem_tag, {})
+            etype = element_types.get(elem_tag, "girder")
+
+            if etype == "column":
+                cap = _get_rc_column_capacity(section)
+            else:
+                cap = _get_section_capacity(section, fy_ksi)
+
+            # Extract max forces from envelope
+            # Envelope format: {force_type: {max: val, min: val, controlling_combo: str}}
+            M_max = abs(_safe_get(env, "moment", "max"))
+            M_min = abs(_safe_get(env, "moment", "min"))
+            M_demand = max(M_max, M_min)
+            M_combo = _safe_get(env, "moment", "controlling_combo", default="Strength I")
+
+            V_max = abs(_safe_get(env, "shear", "max"))
+            V_min = abs(_safe_get(env, "shear", "min"))
+            V_demand = max(V_max, V_min)
+            V_combo = _safe_get(env, "shear", "controlling_combo", default="Strength I")
+
+            P_max = abs(_safe_get(env, "axial", "max"))
+            P_min = abs(_safe_get(env, "axial", "min"))
+            P_demand = max(P_max, P_min)
+            P_combo = _safe_get(env, "axial", "controlling_combo", default="Strength I")
+
+            location = f"Element {elem_tag}"
+
+            # 1. Flexure DCR
+            phi_Mn = cap.get("phi_Mn", 0.0)
+            if M_demand > 0 and phi_Mn > 0:
+                dcr_flex = M_demand / phi_Mn
+                element_results.append({
+                    "element": elem_tag,
+                    "location": location,
+                    "dcr": round(dcr_flex, 4),
+                    "force_type": "moment",
+                    "controlling_combo": str(M_combo),
+                    "demand": round(M_demand, 1),
+                    "capacity": round(phi_Mn, 1),
+                })
+
+            # 2. Shear DCR
+            phi_Vn = cap.get("phi_Vn", 0.0)
+            if V_demand > 0 and phi_Vn > 0:
+                dcr_shear = V_demand / phi_Vn
+                element_results.append({
+                    "element": elem_tag,
+                    "location": location,
+                    "dcr": round(dcr_shear, 4),
+                    "force_type": "shear",
+                    "controlling_combo": str(V_combo),
+                    "demand": round(V_demand, 1),
+                    "capacity": round(phi_Vn, 1),
+                })
+
+            # 3. Axial DCR (primarily for columns)
+            phi_Pn = cap.get("phi_Pn", 0.0)
+            if P_demand > 0 and phi_Pn > 0:
+                dcr_axial = P_demand / phi_Pn
+                element_results.append({
+                    "element": elem_tag,
+                    "location": location,
+                    "dcr": round(dcr_axial, 4),
+                    "force_type": "axial",
+                    "controlling_combo": str(P_combo),
+                    "demand": round(P_demand, 1),
+                    "capacity": round(phi_Pn, 1),
+                })
+
+            # 4. P-M Interaction DCR for columns
+            #    AASHTO: (Pu/φPn) + (8/9)(Mu/φMn) when Pu/φPn ≥ 0.2
+            #    else:   (Pu/2φPn) + (Mu/φMn)
+            if etype == "column" and phi_Pn > 0 and phi_Mn > 0 and (P_demand > 0 or M_demand > 0):
+                pu_ratio = P_demand / phi_Pn
+                mu_ratio = M_demand / phi_Mn if phi_Mn > 0 else 0.0
+
+                if pu_ratio >= 0.2:
+                    dcr_pm = pu_ratio + (8.0 / 9.0) * mu_ratio
+                else:
+                    dcr_pm = (pu_ratio / 2.0) + mu_ratio
+
+                element_results.append({
+                    "element": elem_tag,
+                    "location": location,
+                    "dcr": round(dcr_pm, 4),
+                    "force_type": "P-M interaction",
+                    "controlling_combo": str(M_combo),
+                    "demand": round(P_demand, 1),
+                    "capacity": round(phi_Pn, 1),
+                })
+
+    # --- 5. Deflection DCR ---
+    if displacements:
+        max_defl = 0.0
+        max_defl_node = None
+        for node_tag_str, node_disp in displacements.items():
+            # node_disp may be {combo_name: {dx, dy, dz, ...}} or {dy: val}
+            if isinstance(node_disp, dict):
+                for key, val in node_disp.items():
+                    if isinstance(val, dict):
+                        # Nested by combo
+                        dy = abs(val.get("dy", 0.0) or val.get("Dy", 0.0) or 0.0)
+                    elif key.lower() in ("dy", "uy", "dz", "uz"):
+                        dy = abs(val) if isinstance(val, (int, float)) else 0.0
+                    else:
+                        continue
+                    if dy > max_defl:
+                        max_defl = dy
+                        max_defl_node = node_tag_str
+
+        if max_defl > 0 and spans_in:
+            L_max = max(spans_in)
+            defl_limit = L_max / 800.0  # AASHTO vehicular bridge limit
+            dcr_defl = max_defl / defl_limit if defl_limit > 0 else 0.0
+
+            element_results.append({
+                "element": None,
+                "location": f"Node {max_defl_node}" if max_defl_node else "Global",
+                "dcr": round(dcr_defl, 4),
+                "force_type": "deflection",
+                "controlling_combo": "Service I",
+                "demand": round(max_defl, 4),
+                "capacity": round(defl_limit, 4),
+            })
+
+    # --- 6. Stability check (modal) ---
+    if modal:
+        has_negative_eigenvalue = False
+        for mode_key, mode_data in modal.items():
+            if isinstance(mode_data, dict):
+                period = mode_data.get("period", 0.0)
+                freq = mode_data.get("frequency", 0.0)
+                eigenvalue = mode_data.get("eigenvalue", None)
+                # Negative eigenvalue or NaN period → instability
+                if eigenvalue is not None and eigenvalue < 0:
+                    has_negative_eigenvalue = True
+                if period is not None and (math.isnan(period) or math.isinf(period)):
+                    has_negative_eigenvalue = True
+
+        if has_negative_eigenvalue:
+            element_results.append({
+                "element": None,
+                "location": "Global",
+                "dcr": 999.0,
+                "force_type": "stability",
+                "controlling_combo": "Modal Analysis",
+                "demand": None,
+                "capacity": None,
+            })
+
+    # --- Use controlling_cases as fallback ---
+    if not element_results and controlling:
+        for cc in controlling:
+            dcr_val = cc.get("dcr", 0.0)
+            if dcr_val is None:
+                continue
+            element_results.append({
+                "element": cc.get("element"),
+                "location": cc.get("description", f"Element {cc.get('element')}"),
+                "dcr": float(dcr_val),
+                "force_type": cc.get("check", "unknown"),
+                "controlling_combo": cc.get("combo", "Strength I"),
+            })
+
+    return element_results
+
+
+def _check_analysis_convergence(analysis_results: dict) -> list[Finding]:
+    """Check for analysis convergence issues and return findings.
+
+    If analysis produced no force results, flags it as a critical finding
+    rather than silently returning GREEN.
+    """
+    findings: list[Finding] = []
+
+    if not analysis_results:
+        findings.append(Finding(
+            severity="CRITICAL",
+            vector="DCR Scanner",
+            element=None,
+            location="Global",
+            description=(
+                "Analysis did not converge — no results available. "
+                "Cannot verify structural adequacy."
+            ),
+            dcr=None,
+            controlling_combo="N/A",
+            recommendation=(
+                "Check model connectivity, boundary conditions, and loading. "
+                "Verify OpenSees model builds and runs without errors."
+            ),
+        ))
+        return findings
+
+    envelopes = analysis_results.get("envelopes", {})
+    displacements = analysis_results.get("displacements", {})
+    reactions = analysis_results.get("reactions", {})
+
+    if not envelopes and not analysis_results.get("dcr", {}):
+        findings.append(Finding(
+            severity="CRITICAL",
+            vector="DCR Scanner",
+            element=None,
+            location="Global",
+            description=(
+                "Analysis did not converge — no force results available. "
+                "Element forces are empty; structural adequacy cannot be verified."
+            ),
+            dcr=None,
+            controlling_combo="N/A",
+            recommendation=(
+                "Investigate analysis convergence. Common causes: singular stiffness "
+                "matrix, unstable boundary conditions, zero-length elements, or "
+                "missing connectivity. Re-run with smaller load steps."
+            ),
+        ))
+
+    if not displacements:
+        findings.append(Finding(
+            severity="WARNING",
+            vector="DCR Scanner",
+            element=None,
+            location="Global",
+            description="No displacement results — deflection check skipped.",
+            dcr=None,
+            controlling_combo="N/A",
+            recommendation="Verify analysis produced displacement output.",
+        ))
+
+    if not analysis_results.get("modal", {}):
+        findings.append(Finding(
+            severity="NOTE",
+            vector="DCR Scanner",
+            element=None,
+            location="Global",
+            description="No modal analysis results — stability and dynamic checks skipped.",
+            dcr=None,
+            controlling_combo="N/A",
+            recommendation="Run eigenvalue analysis to verify structural stability.",
+        ))
+
+    return findings
+
+
+# ===================================================================
 # MAIN ENTRY POINT
 # ===================================================================
 
 def run_red_team(
-    element_results: list[dict],
+    element_results: list[dict] | None = None,
     bridge_info: dict | None = None,
     stage_results: list[dict] | None = None,
     site_constraints: dict | None = None,
@@ -1193,6 +1661,8 @@ def run_red_team(
     sensitivity_analyze_fn=None,
     load_model: dict | None = None,
     vectors: list[str] | None = None,
+    analysis_results: dict | None = None,
+    model: dict | None = None,
 ) -> RedTeamReport:
     """Run the complete red-team analysis.
 
@@ -1231,8 +1701,43 @@ def run_red_team(
     if vectors is None:
         vectors = all_vectors
 
+    if element_results is None:
+        element_results = []
+
     report = RedTeamReport()
     all_findings: list[Finding] = []
+
+    # --- Auto-build element results from analysis data if needed ---
+    if not element_results and analysis_results:
+        element_results = build_element_results_from_analysis(
+            analysis_results, model
+        )
+        logger.info(
+            "Built %d element results from analysis data", len(element_results)
+        )
+
+    # --- Check analysis convergence ---
+    if analysis_results is not None:
+        convergence_findings = _check_analysis_convergence(analysis_results)
+        all_findings.extend(convergence_findings)
+    elif not element_results:
+        # No analysis results AND no element results — flag it
+        all_findings.append(Finding(
+            severity="CRITICAL",
+            vector="DCR Scanner",
+            element=None,
+            location="Global",
+            description=(
+                "Analysis did not converge — no force results available. "
+                "Cannot verify structural adequacy."
+            ),
+            dcr=None,
+            controlling_combo="N/A",
+            recommendation=(
+                "Check model connectivity, boundary conditions, and loading. "
+                "Verify the analysis engine produced output."
+            ),
+        ))
     cascade_chains: list[CascadeChain] = []
     sensitivity_results_list: list[SensitivityResult] = []
     history_matches_list: list[HistoryMatch] = []
