@@ -1739,150 +1739,186 @@ def run_analysis(model: AssembledModel) -> AnalysisResults:
     Note:
         If openseespy is not available, returns empty results with a warning.
     """
-    try:
-        import openseespy.opensees as ops
-    except (ImportError, RuntimeError):
-        try:
-            import opensees.openseespy as ops
-        except ImportError:
-            logger.warning("openseespy not installed — returning empty results")
-            return _extract_empty_results()
+    import json as _json
+    import subprocess
+    import sys
+    import tempfile
+    import os
 
     results = AnalysisResults()
 
-    # Generate the complete OpenSees script (materials, sections, elements,
-    # loads, gravity analysis, modal analysis — everything)
+    # Generate the complete OpenSees script
     script = generate_script(model)
 
-    # Execute the script in a controlled namespace.
-    # The script operates on the global ops module, so after exec() completes
-    # we can query ops directly for results.
-    try:
-        exec_globals = {"__builtins__": __builtins__}
-        exec(script, exec_globals)
-        logger.info("OpenSees script executed: %d nodes, %d elements",
-                     model.node_count, model.element_count)
-    except SystemExit:
-        # The generated script may call sys.exit() on import failure — ignore
-        logger.warning("OpenSees script called sys.exit — continuing with extraction")
-    except Exception as e:
-        logger.error("OpenSees script execution failed: %s", e)
-        results = _extract_empty_results()
-        results.controlling_cases = [{"error": str(e)}]
-        return results
+    # Build a wrapper script that:
+    # 1. Runs the OpenSees analysis (gravity + modal)
+    # 2. Extracts all results into JSON
+    # 3. Writes JSON to a results file
+    # This runs in a SUBPROCESS so segfaults don't kill the parent.
 
-    # --- Compute reactions before extracting ---
+    node_tags = [n["tag"] for n in model.nodes]
+    bc_tags = [bc.get("node", 0) for bc in model.boundary_conditions]
+    el_tags = [el["tag"] for el in model.elements]
+
+    extraction_code = '''
+import json, math, sys
+
+# --- Extract results from live OpenSees state ---
+try:
     try:
-        ops.reactions()
+        import openseespy.opensees as ops
+    except (ImportError, RuntimeError):
+        import opensees.openseespy as ops
+except ImportError:
+    print(json.dumps({"error": "openseespy not installed"}))
+    sys.exit(0)
+
+results = {"displacements": {}, "reactions": {}, "envelopes": {}, "modal": {}, "dcr": {}, "controlling": []}
+node_tags = NODE_TAGS
+bc_tags = BC_TAGS
+el_tags = EL_TAGS
+
+# Reactions
+try:
+    ops.reactions()
+except Exception:
+    pass
+
+# Displacements
+for tag in node_tags:
+    try:
+        d = ops.nodeDisp(tag)
+        if d and len(d) >= 6:
+            results["displacements"][str(tag)] = {"dx": d[0], "dy": d[1], "dz": d[2], "rx": d[3], "ry": d[4], "rz": d[5]}
     except Exception:
         pass
 
-    # --- Extract displacements for all nodes ---
-    displacements = {}
-    for n in model.nodes:
-        tag = n["tag"]
-        try:
-            disp = ops.nodeDisp(tag)
-            if disp and len(disp) >= 6:
-                displacements[tag] = {
-                    "dx": disp[0], "dy": disp[1], "dz": disp[2],
-                    "rx": disp[3], "ry": disp[4], "rz": disp[5],
-                }
-        except Exception:
-            pass  # Node may not exist in OpenSees (tag mismatch)
-    results.displacements = displacements
-
-    # --- Extract reactions at boundary condition nodes ---
-    reactions = {}
-    for bc in model.boundary_conditions:
-        tag = bc.get("node", 0)
-        try:
-            rxn = ops.nodeReaction(tag)
-            if rxn and len(rxn) >= 6:
-                reactions[tag] = {
-                    "Fx": rxn[0], "Fy": rxn[1], "Fz": rxn[2],
-                    "Mx": rxn[3], "My": rxn[4], "Mz": rxn[5],
-                }
-        except Exception:
-            pass
-    results.reactions = reactions
-
-    # --- Extract element forces (envelopes) ---
-    envelopes = {}
-    for el in model.elements:
-        tag = el["tag"]
-        try:
-            forces = ops.eleForce(tag)
-            if forces and len(forces) > 0:
-                force_dict = {}
-                labels = ["N_i", "Vy_i", "Vz_i", "T_i", "My_i", "Mz_i",
-                           "N_j", "Vy_j", "Vz_j", "T_j", "My_j", "Mz_j"]
-                for i, label in enumerate(labels):
-                    if i < len(forces):
-                        force_dict[label] = {
-                            "max": forces[i],
-                            "min": forces[i],
-                            "controlling_combo": "Gravity",
-                        }
-                envelopes[tag] = force_dict
-        except Exception:
-            pass  # Element may not exist or be zero-length
-    results.envelopes = envelopes
-
-    # --- Extract modal data ---
-    # Re-run eigenvalue analysis to capture modal results cleanly
-    modal = {}
+# Reactions at BC nodes
+for tag in bc_tags:
     try:
-        import math
-        num_modes = min(10, max(1, model.node_count))
-        eigenvalues = ops.eigen(num_modes)
-        if isinstance(eigenvalues, (list, tuple)):
-            for i, ev in enumerate(eigenvalues):
-                if ev > 0:
-                    omega = math.sqrt(ev)
-                    period = 2.0 * math.pi / omega
-                    frequency = 1.0 / period if period > 0 else 0.0
-                    modal[i + 1] = {
-                        "eigenvalue": ev,
-                        "period": period,
-                        "frequency": frequency,
-                        "mass_participation": {},
-                    }
+        r = ops.nodeReaction(tag)
+        if r and len(r) >= 6:
+            results["reactions"][str(tag)] = {"Fx": r[0], "Fy": r[1], "Fz": r[2], "Mx": r[3], "My": r[4], "Mz": r[5]}
+    except Exception:
+        pass
+
+# Element forces
+labels = ["N_i", "Vy_i", "Vz_i", "T_i", "My_i", "Mz_i", "N_j", "Vy_j", "Vz_j", "T_j", "My_j", "Mz_j"]
+for tag in el_tags:
+    try:
+        f = ops.eleForce(tag)
+        if f and len(f) > 0:
+            fd = {}
+            for i, lb in enumerate(labels):
+                if i < len(f):
+                    fd[lb] = {"max": f[i], "min": f[i], "controlling_combo": "Gravity"}
+            results["envelopes"][str(tag)] = fd
+    except Exception:
+        pass
+
+# Modal
+try:
+    num_modes = min(10, max(1, len(node_tags)))
+    eigenvalues = ops.eigen(num_modes)
+    if isinstance(eigenvalues, (list, tuple)):
+        for i, ev in enumerate(eigenvalues):
+            if ev > 0:
+                omega = math.sqrt(ev)
+                period = 2.0 * math.pi / omega
+                freq = 1.0 / period if period > 0 else 0.0
+                results["modal"][str(i+1)] = {"eigenvalue": ev, "period": period, "frequency": freq}
+except Exception:
+    pass
+
+# DCR + controlling
+controlling = []
+for tag_s, env in results["envelopes"].items():
+    el_dcr = {}
+    for ft, vals in env.items():
+        el_dcr[ft] = abs(vals.get("max", 0))
+    results["dcr"][tag_s] = el_dcr
+    if el_dcr:
+        mk = max(el_dcr, key=lambda k: abs(el_dcr[k]))
+        controlling.append({"element": int(tag_s), "check": mk, "dcr": el_dcr[mk], "combo": "Gravity", "description": f"Element {tag_s} — {mk}"})
+controlling.sort(key=lambda x: abs(x.get("dcr", 0)), reverse=True)
+results["controlling"] = controlling[:20]
+
+print("__NLB_RESULTS__")
+print(json.dumps(results))
+'''
+
+    extraction_code = extraction_code.replace("NODE_TAGS", repr(node_tags))
+    extraction_code = extraction_code.replace("BC_TAGS", repr(bc_tags))
+    extraction_code = extraction_code.replace("EL_TAGS", repr(el_tags))
+
+    # Combine: analysis script + extraction
+    full_script = script + "\n\n" + extraction_code
+
+    # Write to temp file and run in subprocess (segfault-safe)
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, prefix='nlb_ops_') as f:
+        f.write(full_script)
+        script_path = f.name
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, script_path],
+            capture_output=True, text=True, timeout=120,
+        )
+
+        if proc.returncode == -11 or proc.returncode == 139:
+            logger.error("OpenSees segfaulted (signal 11) — model has connectivity issues")
+            results = _extract_empty_results()
+            results.controlling_cases = [{"error": "OpenSees segfaulted — likely disconnected nodes or singular stiffness matrix. Check model connectivity."}]
+            return results
+        elif proc.returncode != 0:
+            stderr_tail = (proc.stderr or "")[-500:]
+            logger.error("OpenSees exited %d: %s", proc.returncode, stderr_tail)
+            results = _extract_empty_results()
+            results.controlling_cases = [{"error": f"OpenSees exited with code {proc.returncode}: {stderr_tail}"}]
+            return results
+
+        # Parse results from stdout
+        stdout = proc.stdout or ""
+        marker = "__NLB_RESULTS__"
+        if marker in stdout:
+            json_str = stdout[stdout.index(marker) + len(marker):].strip()
+            try:
+                data = _json.loads(json_str)
+            except _json.JSONDecodeError as e:
+                logger.error("Failed to parse OpenSees results JSON: %s", e)
+                results = _extract_empty_results()
+                results.controlling_cases = [{"error": f"JSON parse error: {e}"}]
+                return results
+
+            # Map parsed data back into AnalysisResults
+            results.displacements = {int(k): v for k, v in data.get("displacements", {}).items()}
+            results.reactions = {int(k): v for k, v in data.get("reactions", {}).items()}
+            results.envelopes = {int(k): v for k, v in data.get("envelopes", {}).items()}
+            results.modal = {int(k): v for k, v in data.get("modal", {}).items()}
+            results.dcr = {int(k): v for k, v in data.get("dcr", {}).items()}
+            results.controlling_cases = data.get("controlling", [])
+
+            logger.info("Analysis complete — %d nodes, %d elements, %d modes, %d reactions",
+                        len(results.displacements), len(results.envelopes),
+                        len(results.modal), len(results.reactions))
+        else:
+            # No marker found — analysis ran but extraction didn't produce output
+            logger.warning("OpenSees ran but no results extracted. stdout: %s", stdout[-300:])
+            results = _extract_empty_results()
+            results.controlling_cases = [{"error": "Analysis ran but no results extracted"}]
+
+    except subprocess.TimeoutExpired:
+        logger.error("OpenSees timed out after 120s")
+        results = _extract_empty_results()
+        results.controlling_cases = [{"error": "Analysis timed out after 120 seconds"}]
     except Exception as e:
-        logger.warning("Modal extraction failed: %s", e)
-    results.modal = modal
-
-    # --- Compute basic DCR (demand/capacity ratio) for elements ---
-    dcr = {}
-    for el in model.elements:
-        tag = el["tag"]
-        if tag in envelopes and envelopes[tag]:
-            # Simple DCR placeholder — axial and moment checks
-            el_dcr = {}
-            # Could be refined with section capacities from model.sections
-            for force_type, vals in envelopes[tag].items():
-                el_dcr[force_type] = abs(vals.get("max", 0))
-            dcr[tag] = el_dcr
-    results.dcr = dcr
-
-    # --- Build controlling cases list ---
-    controlling = []
-    for tag, el_dcr in dcr.items():
-        if el_dcr:
-            max_key = max(el_dcr, key=lambda k: abs(el_dcr[k]))
-            controlling.append({
-                "element": tag,
-                "check": max_key,
-                "dcr": el_dcr[max_key],
-                "combo": "Gravity",
-                "description": f"Element {tag} — {max_key}",
-            })
-    # Sort by dcr descending, keep top entries
-    controlling.sort(key=lambda x: abs(x.get("dcr", 0)), reverse=True)
-    results.controlling_cases = controlling[:20]
-
-    logger.info("Analysis complete — %d nodes, %d elements, %d modes, %d reactions",
-                len(results.displacements), len(results.envelopes),
-                len(results.modal), len(results.reactions))
+        logger.error("Subprocess failed: %s", e)
+        results = _extract_empty_results()
+        results.controlling_cases = [{"error": str(e)}]
+    finally:
+        try:
+            os.unlink(script_path)
+        except OSError:
+            pass
 
     return results
