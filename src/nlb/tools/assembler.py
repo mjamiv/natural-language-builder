@@ -1256,7 +1256,8 @@ def _generate_constraints_script(constraints: list[dict]) -> str:
 def _generate_analysis_script(analysis_sequence: list[str],
                               elements: list[dict] | None = None,
                               nodes: list[dict] | None = None,
-                              num_girders: int = 1) -> str:
+                              num_girders: int = 1,
+                              line_girder: bool = False) -> str:
     """Generate analysis commands."""
     lines = [
         "# ============================================================",
@@ -1333,7 +1334,7 @@ def _generate_analysis_script(analysis_sequence: list[str],
                 "",
                 "ops.system('UmfPack')",
                 "ops.numberer('Plain')",
-                "ops.constraints('Penalty', 1.0e12, 1.0e12)",
+                "ops.constraints('Transformation')" if line_girder else "ops.constraints('Penalty', 1.0e12, 1.0e12)",
                 "ops.integrator('LoadControl', 1.0)",
                 "ops.test('NormUnbalance', 1.0e-2, 1000)",
                 "ops.algorithm('Linear')",  # Single-step linear analysis
@@ -1346,7 +1347,7 @@ def _generate_analysis_script(analysis_sequence: list[str],
                 "    ops.wipeAnalysis()",
                 "    ops.system('UmfPack')",
                 "    ops.numberer('Plain')",
-                "    ops.constraints('Penalty', 1.0e12, 1.0e12)",
+                "    ops.constraints('Transformation')" if line_girder else "    ops.constraints('Penalty', 1.0e12, 1.0e12)",
                 "    ops.integrator('LoadControl', 0.01)",
                 "    ops.test('NormUnbalance', 1.0e-2, 500)",
                 "    ops.algorithm('Newton')",
@@ -1365,8 +1366,35 @@ def _generate_analysis_script(analysis_sequence: list[str],
                 "if gravity_ok:",
                 "    print('Gravity analysis converged successfully')",
                 "    ops.loadConst('-time', 0.0)",
+                "",
+                "    # Capture gravity-only forces BEFORE moving loads corrupt eleForce()",
+                "    _gravity_forces = {}",
+                "    _gravity_disps = {}",
+                "    _gravity_reactions = {}",
+                "    all_node_tags = ops.getNodeTags()",
+                "    all_ele_tags = ops.getEleTags()",
+                "    try:",
+                "        ops.reactions()",
+                "    except Exception:",
+                "        pass",
+                "    for _nt in all_node_tags:",
+                "        try:",
+                "            _d = ops.nodeDisp(_nt)",
+                "            if _d: _gravity_disps[_nt] = list(_d)",
+                "            _r = ops.nodeReaction(_nt)",
+                "            if _r and max(abs(v) for v in _r) > 1e-6:",
+                "                _gravity_reactions[_nt] = list(_r)",
+                "        except Exception: pass",
+                "    for _et in all_ele_tags:",
+                "        try:",
+                "            _f = ops.eleForce(_et)",
+                "            if _f: _gravity_forces[_et] = list(_f)",
+                "        except Exception: pass",
                 "else:",
                 "    print('WARNING: Gravity analysis did not converge')",
+                "    _gravity_forces = {}",
+                "    _gravity_disps = {}",
+                "    _gravity_reactions = {}",
                 "",
             ])
         elif step == "modal_analysis":
@@ -1510,7 +1538,13 @@ def _generate_analysis_script(analysis_sequence: list[str],
                 "        for _pi in range(_ml_n_pos):",
                 "            _front_x = _ml_x_min + _ml_step * (_pi + 1)",
                 "",
-                "            # Reset analysis state for this load position",
+                "            # Reset domain to gravity-committed state (undo previous LL)",
+                "            if _ml_pos_count > 0:",
+                "                _prev_pat = _ml_ts_base + _ml_pos_count - 1",
+                "                try:",
+                "                    ops.remove('loadPattern', _prev_pat)",
+                "                except Exception: pass",
+                "                ops.reset()  # resets to last committed state (gravity)",
                 "            ops.wipeAnalysis()",
                 "",
                 "            _ts_tag = _ml_ts_base + _ml_pos_count",
@@ -1545,7 +1579,7 @@ def _generate_analysis_script(analysis_sequence: list[str],
                 "            # Run static analysis for this position",
                 "            ops.system('UmfPack')",
                 "            ops.numberer('Plain')",
-                "            ops.constraints('Penalty', 1.0e12, 1.0e12)",
+                "            ops.constraints('Transformation')" if line_girder else "            ops.constraints('Penalty', 1.0e12, 1.0e12)",
                 "            ops.integrator('LoadControl', 1.0)",
                 "            ops.test('NormUnbalance', 1.0e-2, 100)",
                 "            ops.algorithm('Linear')",
@@ -1662,14 +1696,95 @@ def generate_script(model: AssembledModel) -> str:
     Returns:
         Complete Python script as a string.
     """
-    parts = [
-        _generate_model_setup(),
-        _generate_materials_script(model.materials, model.sections),
-        _generate_nodes_script(model.nodes, model.boundary_conditions, model.elements, model.constraints),
-        _generate_elements_script(model.elements, model.nodes),
-        _generate_constraints_script(model.constraints),
-        _generate_analysis_script(model.analysis_sequence, model.elements, model.nodes, model.num_girders),
-    ]
+    if model.num_girders <= 1:
+        # Line-girder mode: use only superstructure + simple pin supports.
+        # Skip substructure/foundation/bearing chain to avoid constraint
+        # force amplification from rigidLinks + penalty constraints.
+        sup_nodes = [n for n in model.nodes if n.get("_component") == "superstructure"]
+        sup_elems = [e for e in model.elements if e.get("_component") == "superstructure"]
+        sup_mats = [m for m in model.materials if m.get("_component") == "superstructure"]
+        sup_secs = [s for s in model.sections if s.get("_component") == "superstructure"]
+        # Identify support nodes from superstructure's support_nodes list.
+        # These are the original (pre-remap) tags; find their remapped equivalents.
+        sup_node_tags = {n["tag"] for n in sup_nodes}
+        orig_to_new = {n.get("_original_tag"): n["tag"] for n in sup_nodes if "_original_tag" in n}
+
+        # Get support nodes from the superstructure component
+        # (stored in results["superstructure"]["support_nodes"])
+        support_node_tags = set()
+        # The model.nodes have _original_tag — find support nodes by matching
+        # original superstructure support node tags
+        # We store these during assembly as connection metadata
+        # Simplest: find nodes at span-boundary X positions
+        node_x = {n["tag"]: n.get("x", 0.0) for n in sup_nodes}
+        x_sorted = sorted(node_x.items(), key=lambda p: p[1])
+
+        if x_sorted:
+            x_min = x_sorted[0][1]
+            x_max = x_sorted[-1][1]
+
+            # Find nodes closest to each support position
+            # For n_supports, compute X positions from span lengths
+            # Get span info from load cases or analysis sequence
+            total_len = x_max - x_min
+            if total_len > 0:
+                # Count unique connection supports
+                support_indices = set()
+                for conn in model.connections:
+                    si = conn.get("support")
+                    if si is not None:
+                        support_indices.add(si)
+                n_supports = max(len(support_indices), 2)
+
+                # Compute support X positions from accumulated span lengths
+                # Spans are evenly divided (approximate for now)
+                for i in range(n_supports):
+                    target_x = x_min + i * total_len / (n_supports - 1)
+                    closest = min(x_sorted, key=lambda p: abs(p[1] - target_x))
+                    support_node_tags.add(closest[0])
+
+        # Build BCs for line-girder (2D-equivalent beam in 3D space):
+        # 1. ALL nodes: fix Z-translation and X-rotation (out-of-plane restraint)
+        # 2. Support nodes: additionally fix Y (and X at first support = pin)
+        simple_bcs = []
+        support_list = sorted(support_node_tags, key=lambda t: node_x.get(t, 0))
+        support_set = set(support_list)
+        
+        for n in sup_nodes:
+            nt = n["tag"]
+            if nt in support_set:
+                idx = support_list.index(nt)
+                if idx == 0:
+                    # Pin: fix X,Y,Z,Rx; free Ry,Rz
+                    simple_bcs.append({"node": nt, "fixity": [1, 1, 1, 1, 0, 1]})
+                else:
+                    # Roller: fix Y,Z,Rx; free X,Ry,Rz
+                    simple_bcs.append({"node": nt, "fixity": [0, 1, 1, 1, 0, 0]})
+            else:
+                # Non-support: fix out-of-plane DOFs (Z, Rx)
+                simple_bcs.append({"node": nt, "fixity": [0, 0, 1, 1, 0, 0]})
+
+        # Also need geomTransf tags referenced by superstructure elements
+        sup_transf_tags = {e.get("transform") for e in sup_elems if e.get("transform")}
+        # Include transforms from all elements (they don't have _component)
+        # Just keep all geomTransf definitions — they're harmless
+        parts = [
+            _generate_model_setup(),
+            _generate_materials_script(sup_mats, sup_secs),
+            _generate_nodes_script(sup_nodes, simple_bcs, sup_elems, []),
+            _generate_elements_script(sup_elems, sup_nodes),
+            "",  # No constraints needed for line-girder
+            _generate_analysis_script(model.analysis_sequence, sup_elems, sup_nodes, model.num_girders, line_girder=True),
+        ]
+    else:
+        parts = [
+            _generate_model_setup(),
+            _generate_materials_script(model.materials, model.sections),
+            _generate_nodes_script(model.nodes, model.boundary_conditions, model.elements, model.constraints),
+            _generate_elements_script(model.elements, model.nodes),
+            _generate_constraints_script(model.constraints),
+            _generate_analysis_script(model.analysis_sequence, model.elements, model.nodes, model.num_girders),
+        ]
     script = "\n".join(parts)
     return _sanitize_script_for_compatibility(script)
 
@@ -2159,60 +2274,30 @@ node_tags = NODE_TAGS
 bc_tags = BC_TAGS
 el_tags = EL_TAGS
 
-# Reactions
-try:
-    ops.reactions()
-except Exception:
-    pass
+# Use gravity-captured data (pre-moving-load) for clean gravity-only results.
+# _gravity_disps, _gravity_reactions, _gravity_forces were captured after
+# gravity converged but BEFORE moving load analysis corrupts eleForce().
 
-# Displacements
-for tag in node_tags:
-    try:
-        d = ops.nodeDisp(tag)
-        if d and len(d) >= 6:
-            results["displacements"][str(tag)] = {"dx": d[0], "dy": d[1], "dz": d[2], "rx": d[3], "ry": d[4], "rz": d[5]}
-    except Exception:
-        pass
+# Displacements (gravity snapshot)
+for tag_int, d in _gravity_disps.items():
+    if d and len(d) >= 6:
+        results["displacements"][str(tag_int)] = {"dx": d[0], "dy": d[1], "dz": d[2], "rx": d[3], "ry": d[4], "rz": d[5]}
 
-# Reactions
-# 1) Try configured BC nodes first
-for tag in bc_tags:
-    try:
-        r = ops.nodeReaction(tag)
-        if r and len(r) >= 6:
-            results["reactions"][str(tag)] = {"Fx": r[0], "Fy": r[1], "Fz": r[2], "Mx": r[3], "My": r[4], "Mz": r[5]}
-    except Exception:
-        pass
+# Reactions (gravity snapshot)
+for tag_int, r in _gravity_reactions.items():
+    if r and len(r) >= 6:
+        results["reactions"][str(tag_int)] = {"Fx": r[0], "Fy": r[1], "Fz": r[2], "Mx": r[3], "My": r[4], "Mz": r[5]}
 
-# 2) Fallback: capture non-trivial reactions from all model nodes.
-# In some models using equalDOF/rigidLink/penalty constraints, support
-# reactions may appear on connected support-interface nodes instead of
-# the original fixed node tags.
-for tag in node_tags:
-    if str(tag) in results["reactions"]:
-        continue
-    try:
-        r = ops.nodeReaction(tag)
-        if r and len(r) >= 6:
-            mag = max(abs(v) for v in r)
-            if mag > 1.0e-6:  # ignore numerical noise
-                results["reactions"][str(tag)] = {"Fx": r[0], "Fy": r[1], "Fz": r[2], "Mx": r[3], "My": r[4], "Mz": r[5]}
-    except Exception:
-        pass
-
-# Element forces
+# Element forces (gravity snapshot)
 labels = ["N_i", "Vy_i", "Vz_i", "T_i", "My_i", "Mz_i", "N_j", "Vy_j", "Vz_j", "T_j", "My_j", "Mz_j"]
 for tag in el_tags:
-    try:
-        f = ops.eleForce(tag)
-        if f and len(f) > 0:
-            fd = {}
-            for i, lb in enumerate(labels):
-                if i < len(f):
-                    fd[lb] = {"max": f[i], "min": f[i], "controlling_combo": "Gravity"}
-            results["envelopes"][str(tag)] = fd
-    except Exception:
-        pass
+    f = _gravity_forces.get(tag)
+    if f and len(f) > 0:
+        fd = {}
+        for i, lb in enumerate(labels):
+            if i < len(f):
+                fd[lb] = {"max": f[i], "min": f[i], "controlling_combo": "Gravity"}
+        results["envelopes"][str(tag)] = fd
 
 # Modal
 try:

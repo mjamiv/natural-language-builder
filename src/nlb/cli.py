@@ -249,9 +249,11 @@ def run_pipeline(params: dict, output_dir: Path | None = None, verbose: bool = F
         from nlb.tools.superstructure import create_superstructure
         
         super_params = _build_superstructure_params(params)
+        actual_num_girders = super_params.pop("_actual_num_girders", 5)
         superstructure = create_superstructure(**super_params)
         super_dict = _model_to_dict(superstructure)
         results["superstructure"] = super_dict
+        results["superstructure"]["_actual_num_girders"] = actual_num_girders
         
         node_count = len(super_dict.get("nodes", []))
         elem_count = len(super_dict.get("elements", []))
@@ -534,11 +536,15 @@ def _build_superstructure_params(params: dict) -> dict:
         "cable_stayed": "cable_stayed",
     }
     
+    # Use single-line model (1 girder) for analysis.
+    # Multi-girder models cause force amplification from penalty constraints.
+    # Distribution factors handle transverse load distribution.
     p = {
         "bridge_type": type_map.get(btype, "steel_plate_girder_composite"),
         "span_lengths_ft": spans,
-        "num_girders": params.get("num_girders", 5),
+        "num_girders": 1,  # Single-line model; DFs applied in post-processing
         "girder_spacing_ft": params.get("girder_spacing_ft", 8.0),
+        "_actual_num_girders": params.get("num_girders", 5),  # preserved for DF calc
     }
     
     if params.get("deck_width_ft"):
