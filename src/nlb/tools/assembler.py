@@ -1722,11 +1722,10 @@ def run_analysis(model: AssembledModel) -> AnalysisResults:
     """Execute full analysis sequence and extract results.
 
     This function requires openseespy to be installed. It:
-    1. Builds the model in OpenSees from the assembled data
-    2. Runs each analysis step in sequence
-    3. Extracts forces, displacements, reactions at every element/node
-    4. Computes DCR = demand/capacity for each element
-    5. Identifies controlling load combinations
+    1. Generates the complete OpenSees script via generate_script()
+    2. Executes the script (which builds model, runs gravity + modal)
+    3. Extracts forces, displacements, reactions from the live OpenSees state
+    4. Populates AnalysisResults with real data
 
     Args:
         model: AssembledModel from assemble_model().
@@ -1741,35 +1740,143 @@ def run_analysis(model: AssembledModel) -> AnalysisResults:
         import openseespy.opensees as ops
     except ImportError:
         logger.warning("openseespy not installed — returning empty results")
-        results = _extract_empty_results()
-        return results
+        return _extract_empty_results()
 
     results = AnalysisResults()
 
-    # Execute the generated script would be one approach,
-    # but we'll build the model programmatically for better error handling
+    # Generate the complete OpenSees script (materials, sections, elements,
+    # loads, gravity analysis, modal analysis — everything)
+    script = generate_script(model)
+
+    # Execute the script in a controlled namespace.
+    # The script operates on the global ops module, so after exec() completes
+    # we can query ops directly for results.
     try:
-        ops.wipe()
-        ops.model('basic', '-ndm', 3, '-ndf', 6)
-
-        # Define nodes
-        for n in model.nodes:
-            ops.node(n["tag"], n.get("x", 0.0), n.get("y", 0.0), n.get("z", 0.0))
-
-        # Apply boundary conditions
-        for bc in model.boundary_conditions:
-            node = bc.get("node", 0)
-            fixity = bc.get("fixity", [1, 1, 1, 1, 1, 1])
-            ops.fix(node, *fixity)
-
-        # Note: Full material/element/analysis execution would go here
-        # For now, we do modal analysis if possible
-
-        logger.info("OpenSees model built: %d nodes, %d elements",
+        exec_globals = {"__builtins__": __builtins__}
+        exec(script, exec_globals)
+        logger.info("OpenSees script executed: %d nodes, %d elements",
                      model.node_count, model.element_count)
-
+    except SystemExit:
+        # The generated script may call sys.exit() on import failure — ignore
+        logger.warning("OpenSees script called sys.exit — continuing with extraction")
     except Exception as e:
-        logger.error("Analysis failed: %s", e)
+        logger.error("OpenSees script execution failed: %s", e)
         results = _extract_empty_results()
+        results.controlling_cases = [{"error": str(e)}]
+        return results
+
+    # --- Compute reactions before extracting ---
+    try:
+        ops.reactions()
+    except Exception:
+        pass
+
+    # --- Extract displacements for all nodes ---
+    displacements = {}
+    for n in model.nodes:
+        tag = n["tag"]
+        try:
+            disp = ops.nodeDisp(tag)
+            if disp and len(disp) >= 6:
+                displacements[tag] = {
+                    "dx": disp[0], "dy": disp[1], "dz": disp[2],
+                    "rx": disp[3], "ry": disp[4], "rz": disp[5],
+                }
+        except Exception:
+            pass  # Node may not exist in OpenSees (tag mismatch)
+    results.displacements = displacements
+
+    # --- Extract reactions at boundary condition nodes ---
+    reactions = {}
+    for bc in model.boundary_conditions:
+        tag = bc.get("node", 0)
+        try:
+            rxn = ops.nodeReaction(tag)
+            if rxn and len(rxn) >= 6:
+                reactions[tag] = {
+                    "Fx": rxn[0], "Fy": rxn[1], "Fz": rxn[2],
+                    "Mx": rxn[3], "My": rxn[4], "Mz": rxn[5],
+                }
+        except Exception:
+            pass
+    results.reactions = reactions
+
+    # --- Extract element forces (envelopes) ---
+    envelopes = {}
+    for el in model.elements:
+        tag = el["tag"]
+        try:
+            forces = ops.eleForce(tag)
+            if forces and len(forces) > 0:
+                force_dict = {}
+                labels = ["N_i", "Vy_i", "Vz_i", "T_i", "My_i", "Mz_i",
+                           "N_j", "Vy_j", "Vz_j", "T_j", "My_j", "Mz_j"]
+                for i, label in enumerate(labels):
+                    if i < len(forces):
+                        force_dict[label] = {
+                            "max": forces[i],
+                            "min": forces[i],
+                            "controlling_combo": "Gravity",
+                        }
+                envelopes[tag] = force_dict
+        except Exception:
+            pass  # Element may not exist or be zero-length
+    results.envelopes = envelopes
+
+    # --- Extract modal data ---
+    # Re-run eigenvalue analysis to capture modal results cleanly
+    modal = {}
+    try:
+        import math
+        num_modes = min(10, max(1, model.node_count))
+        eigenvalues = ops.eigen(num_modes)
+        if isinstance(eigenvalues, (list, tuple)):
+            for i, ev in enumerate(eigenvalues):
+                if ev > 0:
+                    omega = math.sqrt(ev)
+                    period = 2.0 * math.pi / omega
+                    frequency = 1.0 / period if period > 0 else 0.0
+                    modal[i + 1] = {
+                        "eigenvalue": ev,
+                        "period": period,
+                        "frequency": frequency,
+                        "mass_participation": {},
+                    }
+    except Exception as e:
+        logger.warning("Modal extraction failed: %s", e)
+    results.modal = modal
+
+    # --- Compute basic DCR (demand/capacity ratio) for elements ---
+    dcr = {}
+    for el in model.elements:
+        tag = el["tag"]
+        if tag in envelopes and envelopes[tag]:
+            # Simple DCR placeholder — axial and moment checks
+            el_dcr = {}
+            # Could be refined with section capacities from model.sections
+            for force_type, vals in envelopes[tag].items():
+                el_dcr[force_type] = abs(vals.get("max", 0))
+            dcr[tag] = el_dcr
+    results.dcr = dcr
+
+    # --- Build controlling cases list ---
+    controlling = []
+    for tag, el_dcr in dcr.items():
+        if el_dcr:
+            max_key = max(el_dcr, key=lambda k: abs(el_dcr[k]))
+            controlling.append({
+                "element": tag,
+                "check": max_key,
+                "dcr": el_dcr[max_key],
+                "combo": "Gravity",
+                "description": f"Element {tag} — {max_key}",
+            })
+    # Sort by dcr descending, keep top entries
+    controlling.sort(key=lambda x: abs(x.get("dcr", 0)), reverse=True)
+    results.controlling_cases = controlling[:20]
+
+    logger.info("Analysis complete — %d nodes, %d elements, %d modes, %d reactions",
+                len(results.displacements), len(results.envelopes),
+                len(results.modal), len(results.reactions))
 
     return results
