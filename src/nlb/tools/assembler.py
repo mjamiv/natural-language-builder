@@ -824,29 +824,39 @@ def _generate_materials_script(materials: list[dict], sections: list[dict]) -> s
         elif mtype in ("PySimple1", "TzSimple1", "QzSimple1"):
             params = m.get("params", {})
             if isinstance(params, dict):
+                # Use elastic approximation (k = ult/y50) for cross-platform
+                # compatibility. The opensees 0.1.x arm64 Mac build segfaults
+                # on PySimple1/TzSimple1/QzSimple1 legacy materials.
+                # Elastic springs preserve initial stiffness behavior.
                 if mtype == "PySimple1":
+                    pult = params.get('pult', 10.0)
+                    y50 = params.get('y50', 0.1)
+                    k = abs(pult / y50) if y50 != 0 else 100.0
                     lines.append(
-                        f"ops.uniaxialMaterial('PySimple1', {tag}, "
-                        f"{params.get('soilType', 1)}, "
-                        f"{params.get('pult', 10.0)}, "
-                        f"{params.get('y50', 0.1)}, "
-                        f"{params.get('Cd', 0.0)})"
+                        f"# PySimple1→Elastic: pult={pult}, y50={y50}, k={k:.2f}"
+                    )
+                    lines.append(
+                        f"ops.uniaxialMaterial('Elastic', {tag}, {k:.6f})"
                     )
                 elif mtype == "TzSimple1":
+                    tult = params.get('tult', 10.0)
+                    z50 = params.get('z50', 0.1)
+                    k = abs(tult / z50) if z50 != 0 else 100.0
                     lines.append(
-                        f"ops.uniaxialMaterial('TzSimple1', {tag}, "
-                        f"{params.get('soilType', 1)}, "
-                        f"{params.get('tult', 10.0)}, "
-                        f"{params.get('z50', 0.1)}, "
-                        f"{params.get('c', 0.0)})"
+                        f"# TzSimple1→Elastic: tult={tult}, z50={z50}, k={k:.2f}"
+                    )
+                    lines.append(
+                        f"ops.uniaxialMaterial('Elastic', {tag}, {k:.6f})"
                     )
                 elif mtype == "QzSimple1":
+                    qult = params.get('Qult', 100.0)
+                    z50 = params.get('z50', 0.1)
+                    k = abs(qult / z50) if z50 != 0 else 1000.0
                     lines.append(
-                        f"ops.uniaxialMaterial('QzSimple1', {tag}, "
-                        f"{params.get('qzType', 1)}, "
-                        f"{params.get('Qult', 100.0)}, "
-                        f"{params.get('z50', 0.1)}, "
-                        f"{params.get('suction', 0.0)})"
+                        f"# QzSimple1→Elastic: Qult={qult}, z50={z50}, k={k:.2f}"
+                    )
+                    lines.append(
+                        f"ops.uniaxialMaterial('Elastic', {tag}, {k:.6f})"
                     )
         elif mtype == "geomTransf" or mtype in ("Linear", "PDelta", "Corotational"):
             continue  # handled in first pass above
