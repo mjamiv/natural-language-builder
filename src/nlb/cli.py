@@ -191,6 +191,102 @@ def parse_description(text: str) -> dict:
 
 # ── Pipeline runner ───────────────────────────────────────────────────
 
+def _print_force_summary(analysis: dict, superstructure: dict) -> None:
+    """Print a compact shear/moment summary table after analysis."""
+    envelopes = analysis.get("envelopes", {})
+    ml_envelopes = analysis.get("moving_load_envelopes", {})
+    reactions = analysis.get("reactions", {})
+    displacements = analysis.get("displacements", {})
+    
+    if not envelopes:
+        return
+    
+    # Gather gravity envelope peaks
+    max_pos_M = 0.0  # max positive moment (sagging)
+    max_neg_M = 0.0  # max negative moment (hogging)
+    max_V = 0.0
+    ctrl_pos_elem = ""
+    ctrl_neg_elem = ""
+    ctrl_V_elem = ""
+    
+    for etag, env in envelopes.items():
+        mz = env.get("Mz_i", {})
+        vy = env.get("Vy_i", {})
+        if isinstance(mz, dict):
+            mx = mz.get("max", 0)
+            mn = mz.get("min", 0)
+            if mx > max_pos_M:
+                max_pos_M = mx; ctrl_pos_elem = etag
+            if abs(mn) > abs(max_neg_M):
+                max_neg_M = mn; ctrl_neg_elem = etag
+        if isinstance(vy, dict):
+            v = max(abs(vy.get("max", 0)), abs(vy.get("min", 0)))
+            if v > max_V:
+                max_V = v; ctrl_V_elem = etag
+    
+    # Gather LL envelope peaks
+    ll_max_pos_M = 0.0
+    ll_max_neg_M = 0.0
+    ll_max_V = 0.0
+    for etag, env in ml_envelopes.items():
+        mz = env.get("Mz_i", {})
+        vy = env.get("Vy_i", {})
+        if isinstance(mz, dict):
+            mx = mz.get("max", 0)
+            mn = mz.get("min", 0)
+            if mx > ll_max_pos_M:
+                ll_max_pos_M = mx
+            if abs(mn) > abs(ll_max_neg_M):
+                ll_max_neg_M = mn
+        if isinstance(vy, dict):
+            v = max(abs(vy.get("max", 0)), abs(vy.get("min", 0)))
+            if v > ll_max_V:
+                ll_max_V = v
+    
+    # Max deflection
+    max_defl = 0.0
+    for ntag, d in displacements.items():
+        dy = abs(d.get("dy", 0))
+        if dy > max_defl:
+            max_defl = dy
+    
+    # Total reactions
+    total_fy = sum(r.get("Fy", 0) for r in reactions.values())
+    
+    # Span info
+    spans = superstructure.get("span_lengths", [])
+    n_girders = superstructure.get("_actual_num_girders", superstructure.get("girder_lines", 1))
+    
+    print(f"\n{'─' * 60}")
+    print(f"  {Colors.BOLD}FORCE SUMMARY{Colors.RESET} (per girder line)")
+    print(f"{'─' * 60}")
+    
+    # Dead Load
+    print(f"  {Colors.DIM}Dead Load:{Colors.RESET}")
+    print(f"    M+  = {abs(max_pos_M)/12:>10,.0f} k-ft   (elem {ctrl_pos_elem})" if abs(max_pos_M) > 0.1 else "    M+  =          0 k-ft")
+    print(f"    M−  = {abs(max_neg_M)/12:>10,.0f} k-ft   (elem {ctrl_neg_elem})" if abs(max_neg_M) > 0.1 else "    M−  =          0 k-ft")
+    print(f"    V   = {max_V:>10,.0f} kips   (elem {ctrl_V_elem})" if max_V else "    V   =          0 kips")
+    
+    # Live Load
+    if ml_envelopes:
+        print(f"  {Colors.DIM}Live Load + IM:{Colors.RESET}")
+        print(f"    M+  = {abs(ll_max_pos_M)/12:>10,.0f} k-ft")
+        print(f"    M−  = {abs(ll_max_neg_M)/12:>10,.0f} k-ft")
+        print(f"    V   = {ll_max_V:>10,.0f} kips")
+    
+    # Summary line
+    print(f"  {Colors.DIM}Global:{Colors.RESET}")
+    print(f"    ΣFy = {total_fy:>10,.0f} kips")
+    print(f"    δmax= {max_defl:>10.3f} in")
+    if spans:
+        longest = max(spans) * 12  # ft → in
+        ratio = longest / max_defl if max_defl > 0.001 else float('inf')
+        print(f"    L/δ = {ratio:>10,.0f}" + (f"   (L/{ratio:.0f})" if ratio < 100000 else ""))
+    if n_girders and n_girders > 1:
+        print(f"  {Colors.DIM}({n_girders} girders — distribution factors applied separately){Colors.RESET}")
+    print(f"{'─' * 60}")
+
+
 def run_pipeline(params: dict, output_dir: Path | None = None, verbose: bool = False, dump_script: bool = False):
     """Run the full NLB pipeline from parsed parameters."""
     
@@ -396,6 +492,10 @@ def run_pipeline(params: dict, output_dir: Path | None = None, verbose: bool = F
             analysis_dict = _mock_analysis(model_dict)
         results["analysis"] = analysis_dict
         success("Analysis complete")
+        
+        # ── Force Summary Table ──────────────────────────────────────
+        _print_force_summary(analysis_dict, results.get("superstructure", {}))
+        
     except Exception as e:
         warn(f"Analysis failed (OpenSeesPy may not be available): {e}")
         if verbose:
