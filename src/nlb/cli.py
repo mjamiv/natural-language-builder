@@ -191,7 +191,7 @@ def parse_description(text: str) -> dict:
 
 # ── Pipeline runner ───────────────────────────────────────────────────
 
-def run_pipeline(params: dict, output_dir: Path | None = None, verbose: bool = False):
+def run_pipeline(params: dict, output_dir: Path | None = None, verbose: bool = False, dump_script: bool = False):
     """Run the full NLB pipeline from parsed parameters."""
     
     t0 = time.time()
@@ -364,7 +364,7 @@ def run_pipeline(params: dict, output_dir: Path | None = None, verbose: bool = F
         results["model"] = model_dict
     
     # ── Dump script if requested ────────────────────────────────────
-    if getattr(args, 'dump_script', False):
+    if dump_script:
         try:
             from nlb.tools.assembler import generate_script, AssembledModel
             if isinstance(model, AssembledModel):
@@ -760,7 +760,7 @@ Examples:
     print()
     
     # Run pipeline
-    results = run_pipeline(params, output_dir=Path(args.output), verbose=args.verbose)
+    results = run_pipeline(params, output_dir=Path(args.output), verbose=args.verbose, dump_script=getattr(args, 'dump_script', False))
     
     if args.json and results:
         print(json.dumps(results, indent=2, default=str))

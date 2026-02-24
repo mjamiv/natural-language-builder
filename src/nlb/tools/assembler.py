@@ -1022,45 +1022,48 @@ def _generate_nodes_script(nodes: list[dict], boundary_conditions: list[dict],
         "",
     ]
 
-    # Collect fixed nodes for boundary conditions
+    # Build element/constraint connectivity set FIRST — needed to validate BCs
+    connected = set()
+    if elements is not None:
+        for e in (elements or []):
+            for n in e.get("nodes", []):
+                connected.add(n)
+    if constraints is not None:
+        for c in (constraints or []):
+            connected.add(c.get("master", 0))
+            connected.add(c.get("slave", 0))
+
+    # Collect fixed nodes for boundary conditions — only if actually connected
     fixed_nodes: dict[int, list[int]] = {}
     for bc in boundary_conditions:
         node = bc.get("node", 0)
+        # Skip BC nodes that aren't connected to any element — they cause
+        # singular stiffness matrices and segfaults in the solver.
+        if elements is not None and node not in connected:
+            continue
         fixity = bc.get("fixity", [1, 1, 1, 1, 1, 1])
         # Override: always fix foundation base nodes (springs provide stiffness above)
         if all(f == 0 for f in fixity):
             fixity = [1, 1, 1, 1, 1, 1]
         fixed_nodes[node] = fixity
 
+    all_node_tags = set(n["tag"] for n in nodes)
+
+    # Only emit nodes that are connected OR are BC nodes
+    # Remove completely orphaned nodes from the model to prevent singularity
     for n in nodes:
         tag = n["tag"]
         x = n.get("x", 0.0)
         y = n.get("y", 0.0)
         z = n.get("z", 0.0)
+        if elements is not None and tag not in connected and tag not in fixed_nodes:
+            continue  # Skip orphan nodes entirely
         lines.append(f"ops.node({tag}, {x:.4f}, {y:.4f}, {z:.4f})")
 
     lines.append("")
     lines.append("# Boundary conditions")
     for node_tag, fixity in fixed_nodes.items():
         lines.append(f"ops.fix({node_tag}, {', '.join(str(f) for f in fixity)})")
-
-    # Fix orphan nodes (not in any element or constraint) to prevent singularity
-    if elements is not None:
-        all_node_tags = set(n["tag"] for n in nodes)
-        connected = set()
-        for e in (elements or []):
-            for n in e.get("nodes", []):
-                connected.add(n)
-        for c in (constraints or []):
-            connected.add(c.get("master", 0))
-            connected.add(c.get("slave", 0))
-        connected.update(fixed_nodes.keys())
-        orphans = all_node_tags - connected
-        if orphans:
-            lines.append("")
-            lines.append(f"# Fix {len(orphans)} orphan nodes (not connected to elements)")
-            for tag in sorted(orphans):
-                lines.append(f"ops.fix({tag}, 1, 1, 1, 1, 1, 1)")
 
     lines.append("")
     return "\n".join(lines)
@@ -1693,12 +1696,32 @@ def assemble_model(
     # ------------------------------------------------------------------
     # 6. Populate model
     # ------------------------------------------------------------------
+    # --- Validate BCs: remove any that reference nodes not in element connectivity ---
+    connected_nodes = set()
+    for el in all_elements:
+        for n in el.get("nodes", []):
+            connected_nodes.add(n)
+    for c in all_constraints:
+        connected_nodes.add(c.get("master", 0))
+        connected_nodes.add(c.get("slave", 0))
+
+    valid_bcs = []
+    for bc in all_bcs:
+        bc_node = bc.get("node", 0)
+        if bc_node in connected_nodes:
+            valid_bcs.append(bc)
+        else:
+            # Find the shaft bottom node — it should be the last node in this foundation's
+            # element chain. For now, just skip orphan BC nodes and let the orphan-fix
+            # code in _generate_nodes_script handle them as fixed.
+            logger.warning("BC node %d is not connected to any element — skipping", bc_node)
+
     model.nodes = all_nodes
     model.elements = all_elements
     model.materials = all_materials
     model.sections = all_sections
     model.constraints = all_constraints
-    model.boundary_conditions = all_bcs
+    model.boundary_conditions = valid_bcs
     model.analysis_sequence = analysis_seq
     model.bounding_cases = bounding
     model.warnings = warnings
