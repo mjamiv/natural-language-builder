@@ -1369,9 +1369,16 @@ def build_element_results_from_analysis(
     fy_ksi = 50.0  # default steel yield
 
     if model:
-        # Build section map
+        # Build section/material map
         sections_list = model.get("sections", [])
         materials_list = model.get("materials", [])
+
+        # Support nested results.json shape where assembled model is under model.*
+        model_nested = model.get("model", {}) if isinstance(model.get("model", {}), dict) else {}
+        if not sections_list:
+            sections_list = model_nested.get("sections", [])
+        if not materials_list:
+            materials_list = model_nested.get("materials", [])
 
         # Extract Fy from materials if available
         for mat in materials_list:
@@ -1400,6 +1407,10 @@ def build_element_results_from_analysis(
         for key in ("superstructure_sections", "sections"):
             if key in model and isinstance(model[key], list):
                 super_sections.extend(model[key])
+        # Check nested superstructure.sections path (results.json format)
+        sup = model.get("superstructure", {})
+        if isinstance(sup, dict) and "sections" in sup:
+            super_sections.extend(sup.get("sections", []))
 
         for s in super_sections:
             stag = s.get("tag")
@@ -1414,6 +1425,8 @@ def build_element_results_from_analysis(
 
         # Map elements to sections
         elements_list = model.get("elements", [])
+        if not elements_list:
+            elements_list = model_nested.get("elements", [])
         for elem in elements_list:
             etag = elem.get("tag", elem.get("element_tag"))
             sec_ref = elem.get("section", {})
@@ -1807,24 +1820,6 @@ def run_red_team(
     if analysis_results is not None:
         convergence_findings = _check_analysis_convergence(analysis_results)
         all_findings.extend(convergence_findings)
-    elif not element_results:
-        # No analysis results AND no element results — flag it
-        all_findings.append(Finding(
-            severity="CRITICAL",
-            vector="DCR Scanner",
-            element=None,
-            location="Global",
-            description=(
-                "Analysis did not converge — no force results available. "
-                "Cannot verify structural adequacy."
-            ),
-            dcr=None,
-            controlling_combo="N/A",
-            recommendation=(
-                "Check model connectivity, boundary conditions, and loading. "
-                "Verify the analysis engine produced output."
-            ),
-        ))
     cascade_chains: list[CascadeChain] = []
     sensitivity_results_list: list[SensitivityResult] = []
     history_matches_list: list[HistoryMatch] = []

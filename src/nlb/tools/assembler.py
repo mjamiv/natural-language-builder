@@ -1917,6 +1917,15 @@ def run_analysis(model: AssembledModel) -> AnalysisResults:
     bc_tags = [bc.get("node", 0) for bc in model.boundary_conditions]
     el_tags = [el["tag"] for el in model.elements]
 
+    # BUG FIX: Extract actual fixed nodes from the generated script.
+    # The orphan-node filter may drop some BC nodes, so bc_tags from
+    # model.boundary_conditions can include nodes that don't exist in
+    # the script. Parse the script to get the real fixed nodes.
+    import re as _re
+    fixed_in_script = [int(m) for m in _re.findall(r'ops\.fix\((\d+),', script)]
+    if fixed_in_script:
+        bc_tags = fixed_in_script
+
     extraction_code = '''
 import json, math, sys
 
@@ -1950,12 +1959,29 @@ for tag in node_tags:
     except Exception:
         pass
 
-# Reactions at BC nodes
+# Reactions
+# 1) Try configured BC nodes first
 for tag in bc_tags:
     try:
         r = ops.nodeReaction(tag)
         if r and len(r) >= 6:
             results["reactions"][str(tag)] = {"Fx": r[0], "Fy": r[1], "Fz": r[2], "Mx": r[3], "My": r[4], "Mz": r[5]}
+    except Exception:
+        pass
+
+# 2) Fallback: capture non-trivial reactions from all model nodes.
+# In some models using equalDOF/rigidLink/penalty constraints, support
+# reactions may appear on connected support-interface nodes instead of
+# the original fixed node tags.
+for tag in node_tags:
+    if str(tag) in results["reactions"]:
+        continue
+    try:
+        r = ops.nodeReaction(tag)
+        if r and len(r) >= 6:
+            mag = max(abs(v) for v in r)
+            if mag > 1.0e-6:  # ignore numerical noise
+                results["reactions"][str(tag)] = {"Fx": r[0], "Fy": r[1], "Fz": r[2], "Mx": r[3], "My": r[4], "Mz": r[5]}
     except Exception:
         pass
 
